@@ -57,7 +57,7 @@ export RELAX_TQ_GLOBAL_SEGMENT_SIZE_GB=8
 
 ## Correctness 与依赖 gate
 
-当前 Relax pin 为 TransferQueue `6c7a587292910af0827f027de99e005e1900310e`，并要求 `MOONCAKE_CORRECTNESS_CONTRACT_VERSION >= 1`。Contract version 1 保证：
+当前 Relax pin 为 TransferQueue `9784ad0d8a5f0db93ff8326379ab2a6d06e640a0`，并要求 `MOONCAKE_CORRECTNESS_CONTRACT_VERSION >= 1`。Contract version 1 保证：
 
 - `batch_upsert_from` 和 `batch_get_into` 的每次 batch/retry 都校验返回结果与请求 key 等长；
 - `batch_remove` 的非幂等失败向调用方传播；
