@@ -48,7 +48,7 @@ from relax.utils.logging_utils import get_logger
 from relax.utils.misc import load_function
 from relax.utils.multimodal.config import MultimodalConfig
 from relax.utils.s3_model_loader import prepare_model_maybe_update_args
-from relax.utils.tq.lifecycle import attach_tq_client
+from relax.utils.tq.lifecycle import attach_tq_client, detach_tq_client
 from relax.utils.training.eval_config import build_named_prompt_data_configs
 from relax.utils.utils import dict_to_tensordict
 
@@ -452,16 +452,47 @@ class _SFTBatchProducerActor:
             "samples": len(samples),
         }
 
+    def _release_tq_client(self) -> None:
+        """Detach this shard's TQ client on teardown.
+
+        The producer attaches the one process-global TQ client its shard owns,
+        so it must release it the same way the other component actors do:
+        otherwise the Mooncake segment stays registered until ``client_ttl``
+        and a fast restart can hit a stale endpoint.
+        """
+        if getattr(self, "data_system_client", None) is None:
+            return
+        try:
+            detach_tq_client()
+        except Exception as exc:  # best-effort: the master-side TTL still reclaims the segment
+            self._logger.warning(f"SFT remote batch producer TQ detach failed: {exc}")
+            return
+        self.data_system_client = None
+
+    def __del__(self) -> None:
+        # Best-effort detach on graceful teardown; ray.kill / fate-sharing
+        # kills skip destructors, in which case the Mooncake master TTL
+        # reclaims the segment.
+        try:
+            self._release_tq_client()
+        except Exception:  # destructor must never raise (interpreter shutdown)
+            return
+
     async def stop(self) -> None:
-        if self._dataset is not None:
-            self._dataset.stop()
-        if self._processor_pool is not None:
-            close = getattr(self._processor_pool, "close", None)
-            shutdown = getattr(self._processor_pool, "shutdown", None)
-            if callable(close):
-                close()
-            elif callable(shutdown):
-                shutdown()
+        try:
+            if self._dataset is not None:
+                self._dataset.stop()
+            if self._processor_pool is not None:
+                close = getattr(self._processor_pool, "close", None)
+                shutdown = getattr(self._processor_pool, "shutdown", None)
+                if callable(close):
+                    close()
+                elif callable(shutdown):
+                    shutdown()
+        finally:
+            # Detach even when the local workers fail to stop, so the segment
+            # deregisters now instead of lingering until client_ttl.
+            self._release_tq_client()
 
 
 @serve.deployment

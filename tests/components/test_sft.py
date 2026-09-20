@@ -346,6 +346,73 @@ def test_sft_remote_batch_producer_restricts_train_pool_for_eval_size(monkeypatc
     fake_dataset.restrict_training_indices.assert_called_once_with(train_indices)
 
 
+def _make_remote_producer(monkeypatch, sft_module):
+    detach = MagicMock()
+    monkeypatch.setattr(sft_module, "detach_tq_client", detach)
+
+    args = _make_args(global_batch_size=2)
+    producer_cls = sft_module._SFTBatchProducerActor.__ray_metadata__.modified_class
+    producer = producer_cls(args, shard_id=0, num_shards=2, prefetch_num_workers=1)
+    producer.data_system_client = MagicMock()
+    producer._dataset = MagicMock()
+    producer._processor_pool = MagicMock()
+    return producer, detach
+
+
+@pytest.mark.asyncio
+async def test_sft_remote_batch_producer_detaches_tq_client_on_stop(monkeypatch):
+    from relax.components import sft as sft_module
+
+    producer, detach = _make_remote_producer(monkeypatch, sft_module)
+
+    await producer.stop()
+
+    detach.assert_called_once_with()
+    assert producer.data_system_client is None
+    producer._dataset.stop.assert_called_once_with()
+    producer._processor_pool.close.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+async def test_sft_remote_batch_producer_stop_detaches_once_across_repeated_stops(monkeypatch):
+    from relax.components import sft as sft_module
+
+    producer, detach = _make_remote_producer(monkeypatch, sft_module)
+
+    await producer.stop()
+    await producer.stop()
+
+    detach.assert_called_once_with()
+    assert producer.data_system_client is None
+
+
+@pytest.mark.asyncio
+async def test_sft_remote_batch_producer_stop_detaches_when_local_workers_fail(monkeypatch):
+    from relax.components import sft as sft_module
+
+    producer, detach = _make_remote_producer(monkeypatch, sft_module)
+    producer._dataset.stop.side_effect = RuntimeError("worker join failed")
+
+    with pytest.raises(RuntimeError, match="worker join failed"):
+        await producer.stop()
+
+    detach.assert_called_once_with()
+    assert producer.data_system_client is None
+
+
+def test_sft_remote_batch_producer_detaches_tq_client_on_actor_teardown(monkeypatch):
+    from relax.components import sft as sft_module
+
+    producer, detach = _make_remote_producer(monkeypatch, sft_module)
+
+    # Graceful actor teardown without a stop() call must still release the shard's
+    # TQ client instead of leaving its segment until client_ttl.
+    producer.__del__()
+
+    detach.assert_called_once_with()
+    assert producer.data_system_client is None
+
+
 @pytest.mark.asyncio
 async def test_sft_remote_batch_producer_reprimes_before_second_step(monkeypatch):
     from relax.components import sft as sft_module
