@@ -161,7 +161,8 @@ def build_simple_storage_config(total_storage_size: int | None, num_data_storage
     """Build the SimpleStorage backend config.
 
     ``total_storage_size=None`` preserves TransferQueue's unlimited-capacity
-    benchmark semantics; production Relax jobs pass a concrete sample count.
+    semantics. Relax uses it for production too because agent/tool fan-out can
+    make physical row counts exceed the logical rollout batch size.
     """
     return {
         # ``tq.init`` selects the manager from this key alone (TQ config.yaml:22
@@ -311,9 +312,10 @@ def estimate_payload_bytes(args: Any) -> int:
 def validate_segment_capacity(args: Any) -> str | None:
     """Return an error message if segment capacity is insufficient, else None.
 
-    Only meaningful for MooncakeStore (SimpleStorage manages its own capacity
-    via ``total_storage_size``), so callers invoke it on the Mooncake path
-    only. The check is conservative: it compares the *per-client* segment size
+    Only meaningful for MooncakeStore (SimpleStorage runs with
+    ``total_storage_size=None``, i.e. no fixed row cap, and sizes itself by
+    available memory), so callers invoke it on the Mooncake path only. The
+    check is conservative: it compares the *per-client* segment size
     (``global_segment_size``) against the in-flight upper bound.
     """
     max_staleness = getattr(args, "max_staleness", 0)
@@ -343,7 +345,6 @@ def build_backend_config(
     *,
     device: str,
     master_address: str,
-    total_storage_size: int,
 ) -> tuple[dict[str, Any], str | None]:
     """Return ``(backend_config_dict, error_or_none)`` for the host-RDMA path.
 
@@ -352,12 +353,17 @@ def build_backend_config(
     checked value is the one the client receives.  On a capacity error the
     returned dict is a safe SimpleStorage fallback and ``error`` explains why
     MooncakeStore was rejected -- the caller decides whether that is fatal.
+
+    The fallback stays unbounded (``total_storage_size=None``): SimpleStorage
+    caps physical rows, and agent/tool fan-out can write more rows than the
+    logical rollout batch holds identities, so any logical-batch-derived cap
+    would reject the first rollout write.
     """
     cap_error = validate_segment_capacity(args)
     if cap_error:
         logger.error(cap_error)
         return build_simple_storage_config(
-            total_storage_size=total_storage_size,
+            total_storage_size=None,
             num_data_storage_units=args.num_data_storage_units,
         ), cap_error
 

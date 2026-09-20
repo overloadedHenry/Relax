@@ -37,7 +37,7 @@ def _config(**overrides: Any) -> SimpleNamespace:
 def _resolve(config: SimpleNamespace) -> dict[str, Any]:
     instance = controller.Controller.__new__(controller.Controller)
     instance.config = config
-    return instance._resolve_tq_backend(total_storage_size=64)
+    return instance._resolve_tq_backend()
 
 
 def _is_simple(backend: dict[str, Any]) -> bool:
@@ -45,7 +45,7 @@ def _is_simple(backend: dict[str, Any]) -> bool:
 
 
 class _DecisionHarness:
-    def __init__(self, monkeypatch: pytest.MonkeyPatch, failure: str | None) -> None:
+    def __init__(self, monkeypatch: pytest.MonkeyPatch, failure: str | None, *, stub_backend: bool = True) -> None:
         self.calls: list[str] = []
 
         def contract() -> None:
@@ -59,8 +59,8 @@ class _DecisionHarness:
                 raise RuntimeError("master unavailable")
             return _MASTER
 
-        def backend(_args: Any, *, device: str, master_address: str, total_storage_size: int):
-            self.calls.append(f"build:{device}:{master_address}:{total_storage_size}")
+        def backend(_args: Any, *, device: str, master_address: str):
+            self.calls.append(f"build:{device}:{master_address}")
             if failure == "capacity-error":
                 return {"storage_backend": "SimpleStorage"}, "capacity insufficient"
             if failure == "capacity-config":
@@ -72,7 +72,8 @@ class _DecisionHarness:
 
         monkeypatch.setattr(controller, "validate_mooncake_runtime_contract", contract)
         monkeypatch.setattr(controller, "resolve_mooncake_master_address", master)
-        monkeypatch.setattr(controller, "build_backend_config", backend)
+        if stub_backend:
+            monkeypatch.setattr(controller, "build_backend_config", backend)
 
 
 @pytest.mark.parametrize(
@@ -102,7 +103,7 @@ def test_backend_decision_matrix(
     elif failure == "master":
         assert harness.calls == ["contract", "master"]
     else:
-        assert harness.calls == ["contract", "master", f"build:rdma0:{_MASTER}:64"]
+        assert harness.calls == ["contract", "master", f"build:rdma0:{_MASTER}"]
 
 
 @pytest.mark.parametrize("overrides", [{"tq_rdma_mode": "mooncake"}, {"tq_rdma_device": "bad\ndevice"}])
@@ -119,6 +120,58 @@ def test_missing_mode_defaults_to_off(monkeypatch: pytest.MonkeyPatch) -> None:
     del config.tq_rdma_mode
     assert _is_simple(_resolve(config))
     assert harness.calls == []
+
+
+def test_off_mode_simple_storage_is_unbounded(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The real builder runs here: production must never hand SimpleStorage a
+    # logical-batch-derived row cap, because agent/tool fan-out writes more
+    # physical rows than the rollout batch holds identities.
+    _DecisionHarness(monkeypatch, None, stub_backend=False)
+
+    backend = _resolve(_config(tq_rdma_mode="off"))
+
+    assert _is_simple(backend)
+    assert backend["SimpleStorage"] == {"total_storage_size": None, "num_data_storage_units": 1}
+
+
+@pytest.mark.parametrize("failure", ["contract", "master"])
+def test_auto_fallback_simple_storage_is_unbounded(monkeypatch: pytest.MonkeyPatch, failure: str) -> None:
+    _DecisionHarness(monkeypatch, failure, stub_backend=False)
+
+    backend = _resolve(_config(tq_rdma_mode="auto", tq_rdma_device="rdma0"))
+
+    assert _is_simple(backend)
+    assert backend["SimpleStorage"]["total_storage_size"] is None
+
+
+def test_initialized_data_system_keeps_simple_storage_unbounded(monkeypatch: pytest.MonkeyPatch) -> None:
+    instance = controller.Controller.__new__(controller.Controller)
+    instance.config = _config(
+        tq_rdma_mode="off",
+        fully_async=False,
+        balance_data=False,
+        polling_mode=False,
+    )
+    instance._tq_owner = None
+    instance._tq_legacy_init = False
+    captured: dict[str, Any] = {}
+
+    monkeypatch.setattr(controller, "resolve_sft_algo_key", lambda _config: "grpo")
+    monkeypatch.setattr(controller, "compute_dp_size", lambda _config: 1)
+    monkeypatch.setattr(controller, "IdentityWindowSampler", lambda **_kwargs: object())
+    monkeypatch.setattr(controller, "reap_unusable_tq_controller", lambda: None)
+
+    def init(conf: Any) -> Any:
+        captured["conf"] = conf
+        return conf
+
+    monkeypatch.setattr(controller.tq, "init", init)
+
+    instance._initialize_data_system()
+
+    backend = captured["conf"]["backend"]
+    assert _is_simple(backend)
+    assert backend["SimpleStorage"]["total_storage_size"] is None
 
 
 def test_cli_exposes_only_mode_and_device(arguments_module: Any) -> None:
@@ -146,10 +199,15 @@ def test_off_mode_rejects_a_healthy_existing_controller_before_legacy_init(
     instance._tq_owner = None
     instance._tq_legacy_init = False
     monkeypatch.setattr(controller, "resolve_sft_algo_key", lambda _config: "grpo")
-    monkeypatch.setattr(controller, "resolve_tq_capacity_batch_size", lambda _config: 1)
     monkeypatch.setattr(controller, "compute_dp_size", lambda _config: 1)
     monkeypatch.setattr(controller, "IdentityWindowSampler", lambda **_kwargs: object())
-    monkeypatch.setattr(instance, "_resolve_tq_backend", lambda _size: {"storage_backend": "SimpleStorage"})
+    resolved_calls: list[bool] = []
+
+    def resolve_backend() -> dict[str, Any]:
+        resolved_calls.append(True)
+        return {"storage_backend": "SimpleStorage"}
+
+    monkeypatch.setattr(instance, "_resolve_tq_backend", resolve_backend)
     monkeypatch.setattr(
         controller,
         "reap_unusable_tq_controller",
@@ -158,6 +216,7 @@ def test_off_mode_rejects_a_healthy_existing_controller_before_legacy_init(
     monkeypatch.setattr(controller.tq, "init", lambda **_kwargs: pytest.fail("tq.init must not run"))
     with pytest.raises(RuntimeError, match="exclusive cluster"):
         instance._initialize_data_system()
+    assert resolved_calls == [True]
     assert instance._tq_owner is None and instance._tq_legacy_init is False
 
 

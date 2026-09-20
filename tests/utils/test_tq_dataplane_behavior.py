@@ -103,7 +103,7 @@ def tq_factory(_ray_cluster):
     from omegaconf import OmegaConf
     from transfer_queue import GRPOGroupNSampler
 
-    def reinit(capacity: int = 1024):
+    def reinit(capacity: int | None = 1024):
         tq.close()
         if not _wait_controller_gone():
             _force_kill_controller()
@@ -151,6 +151,23 @@ def test_backpressure_fails_without_publishing_data(tq_factory) -> None:
         client.put(_payload(8, ["a"], 4), partition_id="backpressure")
     meta, _ = _get(client, "backpressure", ["a"], 8)
     assert getattr(meta, "size", None) == 0
+
+
+def test_unbounded_capacity_accepts_rows_beyond_the_logical_identities(tq_factory) -> None:
+    """Agent/tool fan-out exports several physical rows per logical identity.
+
+    SimpleStorage's ``total_storage_size`` bounds *physical rows*, so Relax
+    keeps it unbounded in production: a logical-batch-derived cap would reject
+    the first rollout write as soon as one identity exports a main row plus
+    tool rows.
+    """
+    client = tq_factory(capacity=None)
+    client.put(_payload(4, ["a"], 4), partition_id="fan-out")
+    assert getattr(_get(client, "fan-out", ["a"], 4)[0], "size", None) == 4
+
+    bounded = tq_factory(capacity=2)
+    with pytest.raises(RuntimeError, match="capacity"):
+        bounded.put(_payload(4, ["a"], 4), partition_id="fan-out-bounded")
 
 
 def test_empty_get_returns_without_hanging(tq_factory) -> None:

@@ -53,7 +53,6 @@ from relax.utils.s3_model_loader import (
 from relax.utils.tq.config import (
     build_backend_config,
     resolve_mooncake_master_address,
-    resolve_tq_capacity_batch_size,
     validate_config,
     validate_mooncake_runtime_contract,
 )
@@ -343,10 +342,6 @@ class Controller:
 
     def _initialize_data_system(self):
         algo_key = resolve_sft_algo_key(self.config)
-        batch_size_for_capacity = resolve_tq_capacity_batch_size(self.config)
-        total_storage_size = (
-            batch_size_for_capacity * (self.config.max_staleness + 1) * self.config.n_samples_per_prompt
-        )
         dp_size = compute_dp_size(self.config)
         use_sft_prepack = algo_key == "sft" and getattr(self.config, "sft_async_prepack", False)
         if (
@@ -377,7 +372,11 @@ class Controller:
             "sampler": sampler,
             "polling_mode": self.config.polling_mode,
         }
-        backend_config = self._resolve_tq_backend(total_storage_size)
+        # SimpleStorage's row count is physical data written by the producer,
+        # not the logical rollout batch size. Agent/tool fan-out can emit more
+        # than one row per logical identity, so keep its upstream unlimited
+        # capacity semantics. Mooncake uses its own byte-based capacity check.
+        backend_config = self._resolve_tq_backend()
         tq_config = OmegaConf.create(
             {
                 "controller": controller_config,
@@ -408,7 +407,7 @@ class Controller:
                 {
                     "controller": controller_config,
                     "backend": build_simple_storage_config(
-                        total_storage_size=total_storage_size,
+                        total_storage_size=None,
                         num_data_storage_units=self.config.num_data_storage_units,
                     ),
                 },
@@ -501,7 +500,7 @@ class Controller:
             fallback_reason=f"attach_handshake_failed:{len(failures)}_failures",
         )
 
-    def _resolve_tq_backend(self, total_storage_size: int) -> dict:
+    def _resolve_tq_backend(self) -> dict:
         """Resolve the TransferQueue ``backend`` config dict.
 
         This method only validates *configuration*: the requested mode, the
@@ -510,6 +509,10 @@ class Controller:
         ``/sys`` scan cannot see which nodes the scheduler will actually use,
         and host-RDMA capability is established afterwards by the real attach
         handshake in :meth:`_confirm_mooncake_attach`.
+
+        SimpleStorage is always built unbounded: its ``total_storage_size``
+        counts physical rows, which agent/tool fan-out can push past the logical
+        rollout batch, so relaxing it would reject the first rollout write.
 
         ``off`` retains the previous SimpleStorage and ownership semantics.  For
         ``auto``/``required``, any unmet precondition either falls back to
@@ -527,7 +530,7 @@ class Controller:
             from relax.utils.tq.config import build_simple_storage_config
 
             return build_simple_storage_config(
-                total_storage_size=total_storage_size,
+                total_storage_size=None,
                 num_data_storage_units=self.config.num_data_storage_units,
             )
 
@@ -573,7 +576,6 @@ class Controller:
                 self.config,
                 device=device,
                 master_address=master_address,
-                total_storage_size=total_storage_size,
             )
         except RuntimeError as e:
             return _fall_back_or_raise("the segment-capacity configuration is unusable", e)
