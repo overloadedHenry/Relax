@@ -147,7 +147,8 @@ def test_off_mode_rejects_a_healthy_existing_controller_before_legacy_init(
     instance._tq_legacy_init = False
     monkeypatch.setattr(controller, "resolve_sft_algo_key", lambda _config: "grpo")
     monkeypatch.setattr(controller, "resolve_tq_capacity_batch_size", lambda _config: 1)
-    monkeypatch.setattr(controller, "GRPOGroupNSampler", lambda **_kwargs: object())
+    monkeypatch.setattr(controller, "compute_dp_size", lambda _config: 1)
+    monkeypatch.setattr(controller, "IdentityWindowSampler", lambda **_kwargs: object())
     monkeypatch.setattr(instance, "_resolve_tq_backend", lambda _size: {"storage_backend": "SimpleStorage"})
     monkeypatch.setattr(
         controller,
