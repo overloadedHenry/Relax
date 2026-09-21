@@ -127,7 +127,9 @@ Fully Async 模式（流式并行）:
 
 **存储容量与 max_staleness 的关系**：
 
-SimpleStorage 不设行数上限（`total_storage_size=None`），容量按在飞行的物理行数规划。同一时刻最多有 `max_staleness + 1` 个 rollout 批次的数据，例如 `max_staleness=2`、`rollout_batch_size=8`、`n_samples_per_prompt=8` 时最多 `8 × 3 × 8 = 192` 行在飞行中。（早期实现曾按逻辑批次推导 `total_storage_size`，该计算已删除。）
+SimpleStorage 不设固定行数上限（`total_storage_size=None`），这不代表存在自动内存限制。MooncakeStore 则按字节检查容量，通过 `RELAX_TQ_GLOBAL_SEGMENT_SIZE_GB` 配置。
+
+容量规划应考虑 `max_staleness + 1` 个 rollout 批次。固定 `rollout_batch_size=8`、`n_samples_per_prompt=8`、`max_staleness=2` 时，若每个生成样本只写入一行，基准估算为 `8 × 3 × 8 = 192` 行。Agent 或工具调用可能导出额外的物理行，因此该估算不是通用行数上限；实际内存需求还取决于每行的数据大小。
 
 **任务名称**（task_name）用于跟踪不同消费者的消费进度：
 
@@ -483,7 +485,7 @@ while True:
 
 #### 5.3.3 存储容量与 Staleness 的关系
 
-SimpleStorage 不设行数上限（`total_storage_size=None`）。容量必须足以容纳 `max_staleness + 1` 个完整 rollout 的数据：极端情况下 Rollout 可以领先 Actor `max_staleness` 个 step，此时需要同时存储这些 step 的数据。
+Rollout 可以领先 Actor `max_staleness` 个 step，容量规划需考虑 `max_staleness + 1` 个 rollout 批次的数据。该关系用于估算同时驻留的数据量，不是 SimpleStorage 的行数限制；还需考虑每批实际导出的物理行数和每行的数据大小。
 
 ### 5.4 不同 max_staleness 值的效果
 

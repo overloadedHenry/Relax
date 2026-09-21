@@ -129,9 +129,9 @@ Fully Async mode (streaming parallel):
 
 **Storage capacity and max_staleness**:
 
-SimpleStorage is built without a row cap (`total_storage_size=None`). Its capacity counts physical rows, and agent/tool fan-out writes more rows than the logical rollout batch holds identities, so a logical-batch-derived cap would reject the first rollout write. When MooncakeStore backs the data plane, capacity is enforced in bytes instead, through `RELAX_TQ_GLOBAL_SEGMENT_SIZE_GB` (see `relax/utils/tq/config.py`).
+SimpleStorage has no fixed row limit (`total_storage_size=None`). This does not provide an automatic memory limit. MooncakeStore instead uses a byte-capacity check, configured through `RELAX_TQ_GLOBAL_SEGMENT_SIZE_GB` (see `relax/utils/tq/config.py`).
 
-Up to `max_staleness + 1` rollout batches can be in flight at the same time, which is the number to plan capacity for. For example, with `max_staleness=2`, `rollout_batch_size=8`, `n_samples_per_prompt=8`, up to `8 × 3 × 8 = 192` rows are in flight.
+For capacity planning, allow for `max_staleness + 1` rollout batches. With a fixed `rollout_batch_size=8`, `n_samples_per_prompt=8`, and `max_staleness=2`, the baseline is `8 × 3 × 8 = 192` rows when each generated sample produces one stored row. Agent/tool fan-out can produce additional physical rows, so this estimate is not a general row limit; memory requirements also depend on each row's payload size.
 
 **Task names** track consumption progress for different consumers:
 

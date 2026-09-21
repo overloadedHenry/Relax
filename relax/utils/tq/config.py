@@ -19,11 +19,8 @@ import math
 import os
 from typing import Any
 
-from relax.utils.logging_utils import get_logger
 from relax.utils.tq.correctness import ensure_mooncake_correctness_guards
 
-
-logger = get_logger(__name__)
 
 # Accepted ``--tq-rdma-mode`` values; ``off`` keeps the SimpleStorage path.
 TQ_RDMA_MODES = frozenset({"off", "auto", "required"})
@@ -273,9 +270,8 @@ def resolve_tq_capacity_batch_size(args: Any) -> int:
 
     Dynamic partial rollout schedules from the over-sampling pool, so its
     capacity contract is ``over_sampling_batch_size`` rather than the smaller
-    nominal ``rollout_batch_size``.  Keep this resolution shared with the
-    Controller's SimpleStorage sizing so both backends reserve for the same
-    number of samples.
+    nominal ``rollout_batch_size``. This batch size is used to estimate
+    MooncakeStore's payload capacity.
     """
     rollout_batch = getattr(args, "rollout_batch_size")
     if getattr(args, "partial_rollout", False) and getattr(args, "use_dynamic_global_batch_size", False):
@@ -312,11 +308,8 @@ def estimate_payload_bytes(args: Any) -> int:
 def validate_segment_capacity(args: Any) -> str | None:
     """Return an error message if segment capacity is insufficient, else None.
 
-    Only meaningful for MooncakeStore (SimpleStorage runs with
-    ``total_storage_size=None``, i.e. no fixed row cap, and sizes itself by
-    available memory), so callers invoke it on the Mooncake path only. The
-    check is conservative: it compares the *per-client* segment size
-    (``global_segment_size``) against the in-flight upper bound.
+    Only used for MooncakeStore. Compares the per-client segment size
+    (``global_segment_size``) against the estimated in-flight payload.
     """
     max_staleness = getattr(args, "max_staleness", 0)
     capacity_batch = resolve_tq_capacity_batch_size(args)
@@ -350,18 +343,12 @@ def build_backend_config(
 
     ``master_address`` must already be validated by
     :func:`resolve_mooncake_master_address`; it is threaded through so the
-    checked value is the one the client receives.  On a capacity error the
-    returned dict is a safe SimpleStorage fallback and ``error`` explains why
-    MooncakeStore was rejected -- the caller decides whether that is fatal.
-
-    The SimpleStorage fallback stays unbounded (see :func:`build_simple_storage_config`).
+    checked value is the one the client receives. On a capacity error, return
+    an empty config and the error; the caller handles logging and decides
+    whether to build a fallback or fail.
     """
     cap_error = validate_segment_capacity(args)
     if cap_error:
-        logger.error(cap_error)
-        return build_simple_storage_config(
-            total_storage_size=None,
-            num_data_storage_units=args.num_data_storage_units,
-        ), cap_error
+        return {}, cap_error
 
     return build_mooncake_config(master_address=master_address, device=device), None

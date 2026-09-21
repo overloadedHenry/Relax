@@ -372,7 +372,6 @@ class Controller:
             "sampler": sampler,
             "polling_mode": self.config.polling_mode,
         }
-        # No row cap is passed: SimpleStorage counts physical rows, which fan-out can exceed.
         backend_config = self._resolve_tq_backend()
         tq_config = OmegaConf.create(
             {

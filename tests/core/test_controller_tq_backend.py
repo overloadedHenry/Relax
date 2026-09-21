@@ -8,6 +8,7 @@ import argparse
 from contextlib import nullcontext
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -62,7 +63,7 @@ class _DecisionHarness:
         def backend(_args: Any, *, device: str, master_address: str):
             self.calls.append(f"build:{device}:{master_address}")
             if failure == "capacity-error":
-                return {"storage_backend": "SimpleStorage"}, "capacity insufficient"
+                return {}, "capacity insufficient"
             if failure == "capacity-config":
                 raise RuntimeError("capacity configuration unusable")
             return {
@@ -142,6 +143,29 @@ def test_auto_fallback_simple_storage_is_unbounded(monkeypatch: pytest.MonkeyPat
 
     assert _is_simple(backend)
     assert backend["SimpleStorage"]["total_storage_size"] is None
+
+
+@pytest.mark.parametrize("mode", ["auto", "required"])
+def test_capacity_failure_builds_fallback_only_in_auto(monkeypatch: pytest.MonkeyPatch, mode: str) -> None:
+    from relax.utils.tq import config as tq_config
+
+    _DecisionHarness(monkeypatch, None, stub_backend=False)
+    monkeypatch.setenv("RELAX_TQ_GLOBAL_SEGMENT_SIZE_GB", "0.001")
+    simple_builder = MagicMock(wraps=tq_config.build_simple_storage_config)
+    monkeypatch.setattr(tq_config, "build_simple_storage_config", simple_builder)
+    warning = MagicMock()
+    monkeypatch.setattr(controller.logger, "warning", warning)
+
+    if mode == "auto":
+        backend = _resolve(_config(tq_rdma_mode=mode))
+        assert _is_simple(backend)
+        simple_builder.assert_called_once_with(total_storage_size=None, num_data_storage_units=1)
+        warning.assert_called_once()
+    else:
+        with pytest.raises(RuntimeError, match="segment capacity insufficient"):
+            _resolve(_config(tq_rdma_mode=mode))
+        simple_builder.assert_not_called()
+        warning.assert_not_called()
 
 
 def test_initialized_data_system_keeps_simple_storage_unbounded(monkeypatch: pytest.MonkeyPatch) -> None:

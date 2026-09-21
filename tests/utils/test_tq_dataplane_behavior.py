@@ -74,13 +74,8 @@ def _reserved_placement_groups(pg_ids: set[str]) -> set[str]:
 def _reap_placement_groups(pg_ids: set[str]) -> None:
     """Remove placement groups ``tq.init`` created and wait for their CPUs.
 
-    TQ's SimpleStorage bootstrap reserves one CPU per storage unit in a fresh
-    placement group and only removes it on its rollback path, so a successful
-    ``tq.init`` followed by ``tq.close()`` keeps that CPU reserved for the
-    cluster's lifetime -- waiting for the named controller to disappear does
-    not return it.  The reward tests leave an 8-CPU cluster behind, so one
-    leaked bundle per case ends with ``tq.init`` blocked forever inside TQ's
-    unbounded ``ray.get(placement_group.ready())``.
+    SimpleStorage's normal ``tq.close()`` path does not remove these groups.
+    Reclaim them before reinitializing TQ to avoid exhausting cluster CPUs.
     """
     import ray
     from ray._raylet import PlacementGroupID
@@ -101,8 +96,7 @@ def _reap_placement_groups(pg_ids: set[str]) -> None:
 
 
 def _stack_dump_stream(request: pytest.FixtureRequest) -> TextIO:
-    """Deadline-dump sink: pytest captures ``sys.stderr`` and loses it on
-    exit."""
+    """Choose a stack-dump destination that survives a hard exit in CI."""
     override = os.environ.get("RELAX_TEST_STACK_DUMP", "").strip()
     if override:
         return open(override, "a")
@@ -114,13 +108,10 @@ def _stack_dump_stream(request: pytest.FixtureRequest) -> TextIO:
 
 @pytest.fixture(autouse=True)
 def _real_ray_wait_deadline(request: pytest.FixtureRequest) -> Iterator[None]:
-    """Fail fast, with every thread's stack, when a real Ray wait never
-    returns.
+    """Dump thread stacks and exit if a Ray operation hangs.
 
-    ``ray.get`` waits inside Ray's C++ core and cannot be interrupted from
-    Python, and pytest's captured stderr is dropped on a hard exit, so the dump
-    goes to a file next to ``--junitxml`` (CI uploads that directory as an
-    artifact).
+    In CI, write beside ``--junitxml`` so the artifact survives a hard exit
+    without relying on pytest's captured stderr.
     """
     stream = _stack_dump_stream(request)
     faulthandler.dump_traceback_later(_TEST_DEADLINE_SECONDS, exit=True, file=stream)
@@ -243,21 +234,14 @@ def test_backpressure_fails_without_publishing_data(tq_factory) -> None:
     assert getattr(meta, "size", None) == 0
 
 
-def test_unbounded_capacity_accepts_rows_beyond_the_logical_identities(tq_factory) -> None:
-    """Agent/tool fan-out exports several physical rows per logical identity.
-
-    SimpleStorage's ``total_storage_size`` bounds *physical rows*, so Relax
-    keeps it unbounded in production: a logical-batch-derived cap would reject
-    the first rollout write as soon as one identity exports a main row plus
-    tool rows.
-    """
+def test_simple_storage_unbounded_capacity_accepts_rows(tq_factory) -> None:
+    """A None capacity permits writing and reading physical rows."""
     client = tq_factory(capacity=None)
-    client.put(_payload(4, ["a"], 4), partition_id="fan-out")
-    assert getattr(_get(client, "fan-out", ["a"], 4)[0], "size", None) == 4
-
-    bounded = tq_factory(capacity=2)
-    with pytest.raises(RuntimeError, match="capacity"):
-        bounded.put(_payload(4, ["a"], 4), partition_id="fan-out-bounded")
+    payload = _payload(4, ["a"], 4)
+    client.put(payload, partition_id="unbounded")
+    meta, received = _get(client, "unbounded", ["a"], 4)
+    assert meta.size == 4
+    torch.testing.assert_close(received["a"], payload["a"], rtol=0, atol=0)
 
 
 def test_empty_get_returns_without_hanging(tq_factory) -> None:

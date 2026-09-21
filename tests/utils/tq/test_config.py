@@ -14,6 +14,7 @@ import pytest
 
 from relax.utils.tq.config import (
     _split_host_port,
+    build_backend_config,
     build_mooncake_config,
     build_simple_storage_config,
     estimate_payload_bytes,
@@ -208,6 +209,21 @@ def test_segment_size_env_rejects_unusable_values(monkeypatch: pytest.MonkeyPatc
     with pytest.raises(RuntimeError) as excinfo:
         resolve_global_segment_size()
     assert value not in str(excinfo.value)
+
+
+@pytest.mark.parametrize("segment_gib", ["0.001", "4"], ids=["insufficient", "sufficient"])
+def test_backend_config_capacity_contract(monkeypatch: pytest.MonkeyPatch, segment_gib: str) -> None:
+    monkeypatch.setenv("RELAX_TQ_GLOBAL_SEGMENT_SIZE_GB", segment_gib)
+    args = _args()
+
+    backend, error = build_backend_config(args, device="rdma0", master_address=_MASTER)
+
+    if segment_gib == "0.001":
+        assert backend == {}
+        assert error is not None and "capacity insufficient" in error
+    else:
+        assert error is None
+        assert backend == build_mooncake_config(master_address=_MASTER, device="rdma0")
 
 
 def test_capacity_override_and_payload_bound(monkeypatch: pytest.MonkeyPatch) -> None:

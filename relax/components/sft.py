@@ -455,24 +455,19 @@ class _SFTBatchProducerActor:
     def _release_tq_client(self) -> None:
         """Detach this shard's TQ client on teardown.
 
-        The producer attaches the one process-global TQ client its shard owns,
-        so it must release it the same way the other component actors do:
-        otherwise the Mooncake segment stays registered until ``client_ttl``
-        and a fast restart can hit a stale endpoint.
+        Release the Mooncake segment without waiting for the master-side TTL.
         """
         if getattr(self, "data_system_client", None) is None:
             return
         try:
             detach_tq_client()
-        except Exception as exc:  # best-effort: the master-side TTL still reclaims the segment
+        except Exception as exc:
             self._logger.warning(f"SFT remote batch producer TQ detach failed: {exc}")
             return
         self.data_system_client = None
 
     def __del__(self) -> None:
-        # Best-effort detach on graceful teardown; ray.kill / fate-sharing
-        # kills skip destructors, in which case the Mooncake master TTL
-        # reclaims the segment.
+        # Forced termination skips destructors; segment cleanup then relies on TTL.
         try:
             self._release_tq_client()
         except Exception:  # destructor must never raise (interpreter shutdown)
@@ -490,8 +485,7 @@ class _SFTBatchProducerActor:
                 elif callable(shutdown):
                     shutdown()
         finally:
-            # Detach even when the local workers fail to stop, so the segment
-            # deregisters now instead of lingering until client_ttl.
+            # Detach even if local worker cleanup fails.
             self._release_tq_client()
 
 
