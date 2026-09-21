@@ -129,16 +129,9 @@ Fully Async 模式（流式并行）：
 
 **存储容量与 max_staleness**：
 
-```python
-# relax/core/controller.py
-total_storage_size = (
-    self.config.rollout_batch_size
-    * (self.config.max_staleness + 1)
-    * self.config.n_samples_per_prompt
-)
-```
+SimpleStorage 不设行数上限（`total_storage_size=None`）。它的容量统计的是物理行数，而 agent/tool fan-out 写出的行数会超过逻辑 rollout batch 的身份数，因此按逻辑批次推导出的上限会在首次 rollout 写入时就拒绝数据。当数据面由 MooncakeStore 承载时，容量改由字节约束，通过 `RELAX_TQ_GLOBAL_SEGMENT_SIZE_GB` 配置（见 `relax/utils/tq/config.py`）。
 
-TransferQueue 必须能同时缓存 `max_staleness + 1` 个 rollout batch 的数据。例如 `max_staleness=2`、`rollout_batch_size=8`、`n_samples_per_prompt=8` 时，需要 `8 × 3 × 8 = 192` 个样本的存储空间。
+同一时刻最多有 `max_staleness + 1` 个 rollout batch 在飞行中，容量应按这个数量规划。例如 `max_staleness=2`、`rollout_batch_size=8`、`n_samples_per_prompt=8` 时，最多有 `8 × 3 × 8 = 192` 行在飞行中。
 
 **Task names** 用于追踪不同消费者的消费进度：
 

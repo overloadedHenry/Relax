@@ -354,10 +354,7 @@ def build_backend_config(
     returned dict is a safe SimpleStorage fallback and ``error`` explains why
     MooncakeStore was rejected -- the caller decides whether that is fatal.
 
-    The fallback stays unbounded (``total_storage_size=None``): SimpleStorage
-    caps physical rows, and agent/tool fan-out can write more rows than the
-    logical rollout batch holds identities, so any logical-batch-derived cap
-    would reject the first rollout write.
+    The SimpleStorage fallback stays unbounded (see :func:`build_simple_storage_config`).
     """
     cap_error = validate_segment_capacity(args)
     if cap_error:

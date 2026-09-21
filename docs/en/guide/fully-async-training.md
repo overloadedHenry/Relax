@@ -129,16 +129,9 @@ Fully Async mode (streaming parallel):
 
 **Storage capacity and max_staleness**:
 
-```python
-# relax/core/controller.py
-total_storage_size = (
-    self.config.rollout_batch_size
-    * (self.config.max_staleness + 1)
-    * self.config.n_samples_per_prompt
-)
-```
+SimpleStorage is built without a row cap (`total_storage_size=None`). Its capacity counts physical rows, and agent/tool fan-out writes more rows than the logical rollout batch holds identities, so a logical-batch-derived cap would reject the first rollout write. When MooncakeStore backs the data plane, capacity is enforced in bytes instead, through `RELAX_TQ_GLOBAL_SEGMENT_SIZE_GB` (see `relax/utils/tq/config.py`).
 
-TransferQueue must be able to buffer `max_staleness + 1` rollout batches simultaneously. For example, with `max_staleness=2`, `rollout_batch_size=8`, `n_samples_per_prompt=8`, this requires `8 × 3 × 8 = 192` sample slots.
+Up to `max_staleness + 1` rollout batches can be in flight at the same time, which is the number to plan capacity for. For example, with `max_staleness=2`, `rollout_batch_size=8`, `n_samples_per_prompt=8`, up to `8 × 3 × 8 = 192` rows are in flight.
 
 **Task names** track consumption progress for different consumers:
 

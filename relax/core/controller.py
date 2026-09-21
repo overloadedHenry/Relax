@@ -372,10 +372,7 @@ class Controller:
             "sampler": sampler,
             "polling_mode": self.config.polling_mode,
         }
-        # SimpleStorage's row count is physical data written by the producer,
-        # not the logical rollout batch size. Agent/tool fan-out can emit more
-        # than one row per logical identity, so keep its upstream unlimited
-        # capacity semantics. Mooncake uses its own byte-based capacity check.
+        # No row cap is passed: SimpleStorage counts physical rows, which fan-out can exceed.
         backend_config = self._resolve_tq_backend()
         tq_config = OmegaConf.create(
             {
@@ -510,9 +507,8 @@ class Controller:
         and host-RDMA capability is established afterwards by the real attach
         handshake in :meth:`_confirm_mooncake_attach`.
 
-        SimpleStorage is always built unbounded: its ``total_storage_size``
-        counts physical rows, which agent/tool fan-out can push past the logical
-        rollout batch, so relaxing it would reject the first rollout write.
+        SimpleStorage is always built unbounded (see
+        :func:`~relax.utils.tq.config.build_simple_storage_config`).
 
         ``off`` retains the previous SimpleStorage and ownership semantics.  For
         ``auto``/``required``, any unmet precondition either falls back to

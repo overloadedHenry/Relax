@@ -127,16 +127,7 @@ Fully Async 模式（流式并行）:
 
 **存储容量与 max_staleness 的关系**：
 
-```python
-# relax/core/controller.py
-total_storage_size = (
-    self.config.rollout_batch_size
-    * self.config.max_staleness
-    * self.config.n_samples_per_prompt
-)
-```
-
-TransferQueue 需要能够同时缓存 `max_staleness + 1` 个 rollout 批次的数据。例如 `max_staleness=2`、`rollout_batch_size=8`、`n_samples_per_prompt=8` 时，需要 `8 × 3 × 8 = 192` 条样本的存储空间。
+SimpleStorage 不设行数上限（`total_storage_size=None`），容量按在飞行的物理行数规划。同一时刻最多有 `max_staleness + 1` 个 rollout 批次的数据，例如 `max_staleness=2`、`rollout_batch_size=8`、`n_samples_per_prompt=8` 时最多 `8 × 3 × 8 = 192` 行在飞行中。（早期实现曾按逻辑批次推导 `total_storage_size`，该计算已删除。）
 
 **任务名称**（task_name）用于跟踪不同消费者的消费进度：
 
@@ -492,16 +483,7 @@ while True:
 
 #### 5.3.3 存储容量与 Staleness 的关系
 
-```python
-# Controller._initialize_data_system()
-total_storage_size = (
-    self.config.rollout_batch_size
-    * (self.config.max_staleness + 1)
-    * self.config.n_samples_per_prompt
-)
-```
-
-存储容量必须足以容纳 `max_staleness + 1` 个完整 rollout 的数据。因为在极端情况下，Rollout 可以领先 Actor `max_staleness` 个 step，此时需要同时存储这些 step 的数据。
+SimpleStorage 不设行数上限（`total_storage_size=None`）。容量必须足以容纳 `max_staleness + 1` 个完整 rollout 的数据：极端情况下 Rollout 可以领先 Actor `max_staleness` 个 step，此时需要同时存储这些 step 的数据。
 
 ### 5.4 不同 max_staleness 值的效果
 
