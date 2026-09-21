@@ -261,7 +261,11 @@ def test_simple_storage_unbounded_capacity_accepts_rows(tq_factory) -> None:
     client.put(payload, partition_id="unbounded")
     meta, received = _get(client, "unbounded", ["a"], 4)
     assert meta.size == 4
-    torch.testing.assert_close(received["a"], payload["a"], rtol=0, atol=0)
+    expected_rows = payload_rows(payload["a"])
+    actual_rows = payload_rows(received["a"])
+    assert len(actual_rows) == len(expected_rows)
+    for expected, actual in zip(expected_rows, actual_rows, strict=True):
+        assert not diff_digests(leaf_digests(expected), leaf_digests(actual))
 
 
 def test_empty_get_returns_without_hanging(tq_factory) -> None:
