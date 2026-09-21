@@ -10,6 +10,7 @@ import os
 import sys
 import time
 from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any, TextIO
 
 import pytest
@@ -106,8 +107,8 @@ def _stack_dump_stream(request: pytest.FixtureRequest) -> TextIO:
     return sys.stderr
 
 
-@pytest.fixture(autouse=True)
-def _real_ray_wait_deadline(request: pytest.FixtureRequest) -> Iterator[None]:
+@contextmanager
+def _ray_wait_deadline(request: pytest.FixtureRequest) -> Iterator[None]:
     """Dump thread stacks and exit if a Ray operation hangs.
 
     In CI, write beside ``--junitxml`` so the artifact survives a hard exit
@@ -121,6 +122,12 @@ def _real_ray_wait_deadline(request: pytest.FixtureRequest) -> Iterator[None]:
         faulthandler.cancel_dump_traceback_later()
         if stream is not sys.stderr:
             stream.close()
+
+
+@pytest.fixture(autouse=True)
+def _real_ray_wait_deadline(request: pytest.FixtureRequest) -> Iterator[None]:
+    with _ray_wait_deadline(request):
+        yield
 
 
 def _payload(samples: int, fields: list[str], columns: int, seed: int = 0) -> Any:
@@ -161,12 +168,18 @@ def _get(client: Any, partition: str, fields: list[str], size: int) -> Any:
 
 
 @pytest.fixture(scope="module")
-def _ray_cluster():
+def _ray_cluster(request: pytest.FixtureRequest) -> Iterator[None]:
     import ray
 
-    ray.init(ignore_reinit_error=True, logging_level="ERROR")
-    yield
-    ray.shutdown()
+    # Module setup/teardown run outside the per-test watchdog. Arm separate
+    # deadlines so cluster lifecycle calls are covered without timing the module.
+    try:
+        with _ray_wait_deadline(request):
+            ray.init(ignore_reinit_error=True, logging_level="ERROR")
+        yield
+    finally:
+        with _ray_wait_deadline(request):
+            ray.shutdown()
 
 
 @pytest.fixture
@@ -194,16 +207,23 @@ def tq_factory(_ray_cluster):
             },
             flags={"allow_objects": True},
         )
-        tq.init(conf=conf)
-        leaked.update(set(_placement_group_states()) - before)
+        try:
+            tq.init(conf=conf)
+        finally:
+            # Initialization can reserve CPUs before raising an exception.
+            leaked.update(set(_placement_group_states()) - before)
         return tq.get_client()
 
     yield reinit
-    tq.close()
-    _wait_controller_gone()
-    _force_kill_controller()
-    _wait_controller_gone()
-    _reap_placement_groups(leaked)
+    try:
+        tq.close()
+    finally:
+        try:
+            _wait_controller_gone()
+            _force_kill_controller()
+            _wait_controller_gone()
+        finally:
+            _reap_placement_groups(leaked)
 
 
 @pytest.mark.parametrize(
