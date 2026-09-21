@@ -4,9 +4,13 @@
 
 from __future__ import annotations
 
+import faulthandler
 import importlib.util
+import os
+import sys
 import time
-from typing import Any
+from collections.abc import Iterator
+from typing import Any, TextIO
 
 import pytest
 import torch
@@ -27,6 +31,11 @@ pytestmark = pytest.mark.skipif(
 )
 _TQ_ACTOR = "TransferQueueController"
 _TQ_NS = "transfer_queue"
+_PG_REAP_TIMEOUT_SECONDS = 15.0
+# A wait that never returns must fail fast with thread stacks instead of burning
+# the CI job's 60-minute timeout.
+_TEST_DEADLINE_SECONDS = float(os.environ.get("RELAX_TQ_TEST_DEADLINE_SECONDS", "600"))
+_STACK_DUMP_NAME = "hung_thread_stacks.log"
 
 
 def _wait_controller_gone(timeout: float = 20.0) -> bool:
@@ -49,6 +58,78 @@ def _force_kill_controller() -> None:
         ray.kill(ray.get_actor(_TQ_ACTOR, namespace=_TQ_NS))
     except ValueError:
         pass
+
+
+def _placement_group_states() -> dict[str, str]:
+    import ray
+
+    return {pg_id: str(info.get("state")) for pg_id, info in ray.util.placement_group_table().items()}
+
+
+def _reserved_placement_groups(pg_ids: set[str]) -> set[str]:
+    """Placement groups from ``pg_ids`` that still hold their CPU bundles."""
+    return {pg_id for pg_id, state in _placement_group_states().items() if pg_id in pg_ids and state == "CREATED"}
+
+
+def _reap_placement_groups(pg_ids: set[str]) -> None:
+    """Remove placement groups ``tq.init`` created and wait for their CPUs.
+
+    TQ's SimpleStorage bootstrap reserves one CPU per storage unit in a fresh
+    placement group and only removes it on its rollback path, so a successful
+    ``tq.init`` followed by ``tq.close()`` keeps that CPU reserved for the
+    cluster's lifetime -- waiting for the named controller to disappear does
+    not return it.  The reward tests leave an 8-CPU cluster behind, so one
+    leaked bundle per case ends with ``tq.init`` blocked forever inside TQ's
+    unbounded ``ray.get(placement_group.ready())``.
+    """
+    import ray
+    from ray._raylet import PlacementGroupID
+    from ray.util.placement_group import PlacementGroup
+
+    for pg_id in sorted(pg_ids):
+        ray.util.remove_placement_group(PlacementGroup(PlacementGroupID.from_hex(pg_id)))
+
+    deadline = time.time() + _PG_REAP_TIMEOUT_SECONDS
+    while time.time() < deadline and _reserved_placement_groups(pg_ids):
+        time.sleep(0.2)
+    pending = _reserved_placement_groups(pg_ids)
+    if pending:
+        raise RuntimeError(
+            f"placement groups {sorted(pending)} still hold CPUs "
+            f"{_PG_REAP_TIMEOUT_SECONDS:.0f}s after removal; the next tq.init would starve"
+        )
+
+
+def _stack_dump_stream(request: pytest.FixtureRequest) -> TextIO:
+    """Deadline-dump sink: pytest captures ``sys.stderr`` and loses it on
+    exit."""
+    override = os.environ.get("RELAX_TEST_STACK_DUMP", "").strip()
+    if override:
+        return open(override, "a")
+    xml_path = getattr(request.config.option, "xmlpath", None)
+    if xml_path:
+        return open(os.path.join(os.path.dirname(os.path.abspath(xml_path)), _STACK_DUMP_NAME), "a")
+    return sys.stderr
+
+
+@pytest.fixture(autouse=True)
+def _real_ray_wait_deadline(request: pytest.FixtureRequest) -> Iterator[None]:
+    """Fail fast, with every thread's stack, when a real Ray wait never
+    returns.
+
+    ``ray.get`` waits inside Ray's C++ core and cannot be interrupted from
+    Python, and pytest's captured stderr is dropped on a hard exit, so the dump
+    goes to a file next to ``--junitxml`` (CI uploads that directory as an
+    artifact).
+    """
+    stream = _stack_dump_stream(request)
+    faulthandler.dump_traceback_later(_TEST_DEADLINE_SECONDS, exit=True, file=stream)
+    try:
+        yield
+    finally:
+        faulthandler.cancel_dump_traceback_later()
+        if stream is not sys.stderr:
+            stream.close()
 
 
 def _payload(samples: int, fields: list[str], columns: int, seed: int = 0) -> Any:
@@ -103,11 +184,18 @@ def tq_factory(_ray_cluster):
     from omegaconf import OmegaConf
     from transfer_queue import GRPOGroupNSampler
 
+    leaked: set[str] = set()
+
     def reinit(capacity: int | None = 1024):
         tq.close()
         if not _wait_controller_gone():
             _force_kill_controller()
             assert _wait_controller_gone()
+        # Each lifecycle owns a 1-CPU placement group that close() never releases,
+        # so hand the previous one back before reserving a new one.
+        _reap_placement_groups(leaked)
+        leaked.clear()
+        before = set(_placement_group_states())
         conf = OmegaConf.create(
             {
                 "controller": {"sampler": GRPOGroupNSampler(n_samples_per_prompt=1), "polling_mode": True},
@@ -116,6 +204,7 @@ def tq_factory(_ray_cluster):
             flags={"allow_objects": True},
         )
         tq.init(conf=conf)
+        leaked.update(set(_placement_group_states()) - before)
         return tq.get_client()
 
     yield reinit
@@ -123,6 +212,7 @@ def tq_factory(_ray_cluster):
     _wait_controller_gone()
     _force_kill_controller()
     _wait_controller_gone()
+    _reap_placement_groups(leaked)
 
 
 @pytest.mark.parametrize(
