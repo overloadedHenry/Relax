@@ -35,7 +35,8 @@ PROTOCOL_LABELS = {
     "rdma": "C2 Mooncake/RDMA",
 }
 CSV_COLUMNS = (
-    "protocol profile payload_mib actual_mib run measured status error_kind byte_exact mismatch_fields wire_proven "
+    "protocol profile payload_mib actual_mib run measured phase status error_kind cleanup_status cleanup_error_kind "
+    "byte_exact mismatch_fields wire_proven "
     "put_ms get_ms round_ms put_gbs get_gbs ib_mb tcp_mb proof_ib_mb proof_tcp_mb idle_ib_mbps idle_tcp_mbps "
     "relax_sha tq_commit mooncake_version"
 ).split()
@@ -168,6 +169,10 @@ def make_multimodal_payload(num_samples: int, total_mib: int) -> Any:
         },
         batch_size=num_samples,
     )
+    # TQ records scalar columns as one-element rows. Match that wire shape
+    # before computing expected digests, keeping dtype/shape/byte checks strict.
+    for field in ("sample_id", "rewards"):
+        payload.set(field, payload.get(field).unsqueeze(-1))
     if type(payload.get("multimodal_train_inputs")).__name__ != "NonTensorStack":
         raise RuntimeError("multimodal benchmark payload did not produce a NonTensorStack column")
     return payload
@@ -529,26 +534,48 @@ def _run_round(
         )
     except BaseException as error:
         record.update({"status": "error", "error_kind": type(error).__name__})
-        try:
-            producer.clear_partition(partition)
-        except BaseException as cleanup_error:
-            _write_csv_record(writer, csv_handle, record)
-            raise error from cleanup_error
-        _write_csv_record(writer, csv_handle, record)
-        raise
+        gate_error = error
 
+    final_status = record["status"]
+    record.update({"phase": "measurement", "cleanup_status": "pending"})
+    if final_status == "pass":
+        record["status"] = "pending"
+    try:
+        _write_csv_record(writer, csv_handle, record)
+    except BaseException as write_error:
+        if gate_error is None:
+            gate_error = write_error
+            final_status = "error"
+            record["error_kind"] = type(write_error).__name__
+
+    cleanup_failure: BaseException | None = None
     try:
         producer.clear_partition(partition)
-    except BaseException as cleanup_error:
+        record["cleanup_status"] = "pass"
+    except BaseException as error:
+        cleanup_failure = error
+        record.update({"cleanup_status": "error", "cleanup_error_kind": type(error).__name__})
         if gate_error is None:
-            record.update({"status": "error", "error_kind": type(cleanup_error).__name__})
+            final_status = "error"
+            record["error_kind"] = type(error).__name__
+    record.update({"phase": "final", "status": final_status})
+    try:
         _write_csv_record(writer, csv_handle, record)
+    except BaseException as write_error:
         if gate_error is not None:
-            raise gate_error from cleanup_error
+            if cleanup_failure is not None:
+                cleanup_failure.__cause__ = write_error
+                raise gate_error from cleanup_failure
+            raise gate_error from write_error
+        if cleanup_failure is not None:
+            raise cleanup_failure from write_error
         raise
-    _write_csv_record(writer, csv_handle, record)
     if gate_error is not None:
+        if cleanup_failure is not None:
+            raise gate_error from cleanup_failure
         raise gate_error
+    if cleanup_failure is not None:
+        raise cleanup_failure
     return {"put_gbs": put_gbs, "get_gbs": get_gbs}
 
 

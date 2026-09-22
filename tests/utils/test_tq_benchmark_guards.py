@@ -51,6 +51,42 @@ def test_simple_and_multimodal_profiles_use_the_expected_runtime_shapes(monkeypa
     assert bench.field_byte_digests(payload, ["multimodal_train_inputs"]) != digest
 
 
+@pytest.mark.parametrize("num_samples", [1, 3])
+def test_multimodal_scalar_columns_preserve_digests_after_row_reconstruction(num_samples: int) -> None:
+    import torch
+    from tensordict import TensorDict
+    from transfer_queue.metadata import extract_field_schema
+
+    payload = bench.make_multimodal_payload(num_samples=num_samples, total_mib=1)
+    fields = ["sample_id", "rewards"]
+    expected = bench.field_byte_digests(payload, fields)
+    schema = extract_field_schema(payload.select(*fields))
+    received = TensorDict({}, batch_size=[num_samples])
+    for field, dtype in (("sample_id", torch.int64), ("rewards", torch.float32)):
+        column = payload.get(field)
+        assert column.shape == (num_samples, 1)
+        assert column.dtype == dtype
+        # Reconstruct raw row bytes using TQ's actual recorded dtype and shape.
+        field_meta = schema[field]
+        rows = [
+            torch.frombuffer(bytearray(row.numpy().tobytes()), dtype=field_meta["dtype"]).reshape(field_meta["shape"])
+            for row in column.unbind()
+        ]
+        received.set(field, torch.nested.as_nested_tensor(rows, layout=torch.jagged))
+    assert bench.field_byte_digests(received, fields) == expected
+
+    for field in fields:
+        original = received.get(field)
+        for changed in (
+            payload.get(field) + 1,
+            payload.get(field).to(torch.float64),
+            payload.get(field).squeeze(-1),
+        ):
+            received.set(field, changed)
+            assert bench.field_byte_digests(received, fields)[field] != expected[field]
+        received.set(field, original)
+
+
 @pytest.mark.parametrize(
     ("protocol", "ib_bytes", "tcp_bytes", "payload_bytes", "expected"),
     [
@@ -123,10 +159,11 @@ def test_cli_rejects_ambiguous_or_unsafe_counter_configuration(
     [
         (False, 1_000, AssertionError, "byte-exact", "ByteExactMismatch"),
         (True, 0, RuntimeError, "wire proof failed", "WireProofFailed"),
+        (True, 1_000, RuntimeError, "partition cleanup failed", ""),
     ],
-    ids=["byte-exact", "wire-proof"],
+    ids=["byte-exact", "wire-proof", "valid-measurement"],
 )
-def test_failed_gate_is_recorded_and_cleanup_does_not_mask_it(
+def test_round_is_flushed_before_cleanup_and_final_status_preserves_gate_errors(
     monkeypatch: pytest.MonkeyPatch,
     cleanup_fails: bool,
     byte_exact: bool,
@@ -158,13 +195,27 @@ def test_failed_gate_is_recorded_and_cleanup_does_not_mask_it(
 
         def clear_partition(self, _partition: str) -> None:
             events.append("clear")
+            rows = list(csv.DictReader(io.StringIO(output.getvalue())))
+            assert len(rows) == 1
+            assert rows[0]["phase"] == "measurement"
+            assert rows[0]["cleanup_status"] == "pending"
+            assert rows[0]["status"] == ("fail" if error_kind else "pending")
+            assert output.flushes == 1
             if cleanup_fails:
                 raise RuntimeError("partition cleanup failed")
 
-    output = io.StringIO()
+    class FlushedOutput(io.StringIO):
+        flushes = 0
+
+        def flush(self) -> None:
+            self.flushes += 1
+            super().flush()
+
+    output = FlushedOutput()
     writer = csv.DictWriter(output, fieldnames=bench.CSV_COLUMNS)
     writer.writeheader()
-    with pytest.raises(error_type, match=match) as excinfo:
+    raises = bool(error_kind) or cleanup_fails
+    with pytest.raises(error_type, match=match) if raises else nullcontext() as excinfo:
         bench._run_round(
             producer=Producer(),
             consumer=consumer,
@@ -180,11 +231,79 @@ def test_failed_gate_is_recorded_and_cleanup_does_not_mask_it(
             csv_handle=output,
             provenance={"relax_sha": "a" * 40, "tq_commit": "b" * 40, "mooncake_version": "test"},
         )
-    row = next(csv.DictReader(io.StringIO(output.getvalue())))
-    assert (row["status"], row["error_kind"], row["byte_exact"]) == ("fail", error_kind, str(byte_exact))
+    _, row = list(csv.DictReader(io.StringIO(output.getvalue())))
+    assert row["phase"] == "final"
+    assert row["cleanup_status"] == ("error" if cleanup_fails else "pass")
+    assert row["cleanup_error_kind"] == ("RuntimeError" if cleanup_fails else "")
+    expected_status = "fail" if error_kind else ("error" if cleanup_fails else "pass")
+    expected_error = error_kind or ("RuntimeError" if cleanup_fails else "")
+    assert (row["status"], row["error_kind"], row["byte_exact"]) == (expected_status, expected_error, str(byte_exact))
+    assert output.flushes == 2
     assert row["mismatch_fields"] == ("" if byte_exact else "field")
-    assert isinstance(excinfo.value.__cause__, RuntimeError) is cleanup_fails
+    if error_kind:
+        assert isinstance(excinfo.value.__cause__, RuntimeError) is cleanup_fails
     assert events == ["put", "clear"]
+
+
+@pytest.mark.parametrize("cleanup_fails", [False, True])
+@pytest.mark.parametrize("final_write_fails", [False, True])
+def test_transfer_error_is_saved_before_cleanup(
+    monkeypatch: pytest.MonkeyPatch, cleanup_fails: bool, final_write_fails: bool
+) -> None:
+    monkeypatch.setattr(bench.ray, "get", lambda value: value)
+    write_record = bench._write_csv_record
+
+    def write_or_fail(writer, handle, record) -> None:
+        if final_write_fails and record["phase"] == "final":
+            raise OSError("CSV write failed")
+        write_record(writer, handle, record)
+
+    monkeypatch.setattr(bench, "_write_csv_record", write_or_fail)
+    consumer = SimpleNamespace(
+        sample_idle_counters=SimpleNamespace(remote=lambda _seconds: {}),
+        begin_round=SimpleNamespace(remote=lambda: ({}, 1.0)),
+    )
+    output = io.StringIO()
+    writer = csv.DictWriter(output, fieldnames=bench.CSV_COLUMNS)
+    writer.writeheader()
+
+    def clear_partition(_partition: str) -> None:
+        rows = list(csv.DictReader(io.StringIO(output.getvalue())))
+        assert len(rows) == 1
+        assert (rows[0]["phase"], rows[0]["status"], rows[0]["error_kind"]) == ("measurement", "error", "ValueError")
+        if cleanup_fails:
+            raise RuntimeError("cleanup failed")
+
+    producer = SimpleNamespace(
+        put=lambda *_args, **_kwargs: _raise(ValueError("put failed")),
+        clear_partition=clear_partition,
+    )
+    with pytest.raises(ValueError, match="put failed") as excinfo:
+        bench._run_round(
+            producer=producer,
+            consumer=consumer,
+            payload=SimpleNamespace(batch_size=[1]),
+            fields=["field"],
+            expected={"field": ()},
+            nbytes=1_000,
+            protocol="tcp",
+            profile="synthetic",
+            requested_mib=1,
+            run=1,
+            writer=writer,
+            csv_handle=output,
+            provenance={},
+        )
+    rows = list(csv.DictReader(io.StringIO(output.getvalue())))
+    if final_write_fails:
+        assert len(rows) == 1
+        cause = excinfo.value.__cause__
+        assert isinstance(cause.__cause__ if cleanup_fails else cause, OSError)
+    else:
+        _, final = rows
+        assert (final["phase"], final["status"], final["error_kind"]) == ("final", "error", "ValueError")
+        assert final["cleanup_status"] == ("error" if cleanup_fails else "pass")
+    assert isinstance(excinfo.value.__cause__, RuntimeError) is cleanup_fails
 
 
 def test_provenance_records_versions_and_rejects_dirty_checkout(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:

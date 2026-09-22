@@ -99,7 +99,7 @@ python -u scripts/benchmarks/tq_cross_node_bench.py \
 
 C1 会在 driver 及其 Ray worker runtime 中设置 `MC_TCP_ENABLE_CONNECTION_POOL=1`，这是当前 Mooncake/TCP correctness baseline 的组成部分，必须随结果一并记录。benchmark 通过一次性 owner lifecycle 有界初始化 TQ，producer/consumer 均有界 attach；任一失败都非零退出，不执行 backend fallback。
 
-CSV 使用 exclusive-create，不覆盖既有文件。每个 warmup/测量 round 都先落盘再执行 byte-exact/wire gate，失败行包含稳定的 `error_kind`；每轮无论成功失败都清理 partition。每行还记录 Relax SHA、安装的 TransferQueue VCS commit 和 Mooncake package version，且 Relax tracked worktree 不干净时拒绝作为正式验收运行。
+CSV 使用 exclusive-create，不覆盖既有文件。每个 warmup/测量 round 在清理 partition 前写入并 flush 一条 `phase=measurement` 记录，清理结束后追加 `phase=final` 记录。两条记录通过 `protocol/profile/payload_mib/run` 关联；统计最终结果时只使用 `phase=final` 行。测量通过但尚未清理时 `status=pending`，只有校验与清理均成功才记录最终 `status=pass`。`cleanup_status` 和 `cleanup_error_kind` 单独记录清理结果；只有 measurement 行表示该轮未完成，不能算验收通过。校验失败使用稳定的 `error_kind`，同时发生清理失败时仍保留校验错误为主异常。每行还记录 Relax SHA、安装的 TransferQueue VCS commit 和 Mooncake package version，且 Relax tracked worktree 不干净时拒绝作为正式验收运行。
 
 真实多模态 fixture、原始 CSV、版本信息和性能分布属于 PR 验收附件，不在仓库文档维护生成教程或易过期的性能数字。没有双节点 RDMA 环境时必须明确记录“真机验收未执行”，不能用 mock 结果替代。
 
