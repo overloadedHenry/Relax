@@ -52,26 +52,19 @@ def test_simple_and_multimodal_profiles_use_the_expected_runtime_shapes(monkeypa
 
 
 @pytest.mark.parametrize("num_samples", [1, 3])
-def test_multimodal_scalar_columns_preserve_digests_after_row_reconstruction(num_samples: int) -> None:
+def test_multimodal_scalar_columns_preserve_shapes_and_strict_digests(num_samples: int) -> None:
     import torch
     from tensordict import TensorDict
-    from transfer_queue.metadata import extract_field_schema
 
     payload = bench.make_multimodal_payload(num_samples=num_samples, total_mib=1)
     fields = ["sample_id", "rewards"]
     expected = bench.field_byte_digests(payload, fields)
-    schema = extract_field_schema(payload.select(*fields))
     received = TensorDict({}, batch_size=[num_samples])
     for field, dtype in (("sample_id", torch.int64), ("rewards", torch.float32)):
         column = payload.get(field)
         assert column.shape == (num_samples, 1)
         assert column.dtype == dtype
-        # Reconstruct raw row bytes using TQ's actual recorded dtype and shape.
-        field_meta = schema[field]
-        rows = [
-            torch.frombuffer(bytearray(row.numpy().tobytes()), dtype=field_meta["dtype"]).reshape(field_meta["shape"])
-            for row in column.unbind()
-        ]
+        rows = [row.clone() for row in column.unbind()]
         received.set(field, torch.nested.as_nested_tensor(rows, layout=torch.jagged))
     assert bench.field_byte_digests(received, fields) == expected
 
@@ -85,6 +78,34 @@ def test_multimodal_scalar_columns_preserve_digests_after_row_reconstruction(num
             received.set(field, changed)
             assert bench.field_byte_digests(received, fields)[field] != expected[field]
         received.set(field, original)
+
+
+@pytest.mark.parametrize("num_samples", [1, 3])
+def test_multimodal_scalar_columns_round_trip_with_real_tq_metadata(num_samples: int) -> None:
+    import torch
+    import transfer_queue
+    from tensordict import TensorDict
+
+    # CI's module stub fabricates attributes, including __path__, via __getattr__.
+    # Inspect the import spec without invoking that fallback before importing children.
+    spec = vars(transfer_queue).get("__spec__")
+    if spec is not None and spec.submodule_search_locations is None:
+        pytest.skip("Real TransferQueue package required; CI provides a module stub")
+    from transfer_queue.metadata import extract_field_schema
+
+    payload = bench.make_multimodal_payload(num_samples=num_samples, total_mib=1)
+    fields = ["sample_id", "rewards"]
+    schema = extract_field_schema(payload.select(*fields))
+    received = TensorDict({}, batch_size=[num_samples])
+    for field in fields:
+        column = payload.get(field)
+        field_meta = schema[field]
+        rows = [
+            torch.frombuffer(bytearray(row.numpy().tobytes()), dtype=field_meta["dtype"]).reshape(field_meta["shape"])
+            for row in column.unbind()
+        ]
+        received.set(field, torch.nested.as_nested_tensor(rows, layout=torch.jagged))
+    assert bench.field_byte_digests(received, fields) == bench.field_byte_digests(payload, fields)
 
 
 @pytest.mark.parametrize(
