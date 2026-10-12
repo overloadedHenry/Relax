@@ -615,10 +615,14 @@ def _cleanup_failed_owner(owner: Any, *, timeout: float = 10.0) -> None:
     kill_tq_controller_and_wait(timeout=timeout)
 
 
-def _start_owner(*, timeout: float) -> Any:
+def _start_owner(conf: Any, *, timeout: float) -> Any:
     """Create and schedule the isolated owner before candidate fallback."""
+    controller_conf = _get_config_value(conf, "controller", {})
+    required_node_resource = _get_config_value(controller_conf, "required_node_resource", None)
     try:
-        owner = _TransferQueueOwner.remote()
+        owner = _TransferQueueOwner.options(
+            resources={required_node_resource: 1} if required_node_resource else None
+        ).remote()
         ray.get(owner.ready.remote(), timeout=timeout)
     except Exception as error:
         if "owner" in locals():
@@ -680,7 +684,7 @@ def initialize_tq_with_fallback(
     # healthy pre-existing controller is not an RDMA candidate failure and
     # must never be converted into a SimpleStorage attach attempt.
     reap_unusable_tq_controller()
-    owner = _start_owner(timeout=timeout)
+    owner = _start_owner(conf, timeout=timeout)
     try:
         return _attempt(owner, conf)
     except (TqInitializationTimeout, TqInitializationError) as primary_error:
@@ -696,7 +700,7 @@ def initialize_tq_with_fallback(
             # Failed-owner cleanup must leave a clean cluster. Re-check before
             # starting the fallback so unknown residual state fails closed.
             reap_unusable_tq_controller()
-            fallback_owner = _start_owner(timeout=timeout)
+            fallback_owner = _start_owner(fallback_conf, timeout=timeout)
             result = _attempt(fallback_owner, fallback_conf)
         except Exception as fallback_error:
             raise RuntimeError(

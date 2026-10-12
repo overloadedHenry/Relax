@@ -328,6 +328,7 @@ class _InitHarness:
         reap_effects: list[BaseException | None] | None = None,
     ) -> None:
         self.events: list[str] = []
+        self.owner_configs: list[Any] = []
         effects = iter(init_effects)
         reaps = iter(reap_effects or [])
 
@@ -337,8 +338,9 @@ class _InitHarness:
             if effect:
                 raise effect
 
-        def start(*, timeout: float) -> str:
+        def start(conf: Any, *, timeout: float) -> str:
             self.events.append("start")
+            self.owner_configs.append(conf)
             if isinstance(start_effect, BaseException):
                 raise start_effect
             return f"owner-{self.events.count('start')}"
@@ -411,13 +413,19 @@ def test_initialize_and_fallback_transaction_matrix(
         reap_effects=reap_effects,
     )
     primary = _conf("SimpleStorage" if mode == "off" else "MooncakeStore")
+    primary["controller"]["required_node_resource"] = "stable_cpu"
+    fallback = _conf("SimpleStorage")
+    fallback["controller"]["required_node_resource"] = "stable_cpu"
     context = pytest.raises(error) if error else nullcontext()
     with context:
-        result = tq_lifecycle.initialize_tq_with_fallback(primary, mode=mode, fallback_conf=_conf("SimpleStorage"))
+        result = tq_lifecycle.initialize_tq_with_fallback(primary, mode=mode, fallback_conf=fallback)
         assert result.owner is not None
         if mode == "auto" and len(init_effects) == 2:
             assert result.config["backend"]["storage_backend"] == "SimpleStorage"
     assert harness.events == expected_events
+    assert harness.owner_configs[0] is primary
+    if len(harness.owner_configs) > 1:
+        assert harness.owner_configs[1] is fallback
 
 
 class _RemoteMethod:
@@ -437,10 +445,18 @@ class _FakeOwner:
 
 
 @pytest.mark.parametrize("outcome", ["success", "timeout"])
-def test_owner_start_boundary(monkeypatch: pytest.MonkeyPatch, outcome: str) -> None:
+@pytest.mark.parametrize("required_node_resource", [None, "stable_cpu"])
+def test_owner_start_boundary(
+    monkeypatch: pytest.MonkeyPatch, outcome: str, required_node_resource: str | None
+) -> None:
     owner = _FakeOwner()
     stopped: list[Any] = []
-    monkeypatch.setattr(tq_lifecycle._TransferQueueOwner, "remote", lambda: owner)
+    actor_class = MagicMock()
+    actor_class.remote.return_value = owner
+    options = MagicMock(return_value=actor_class)
+    monkeypatch.setattr(tq_lifecycle._TransferQueueOwner, "options", options)
+    conf = _conf("MooncakeStore")
+    conf["controller"]["required_node_resource"] = required_node_resource
     if outcome == "timeout":
         monkeypatch.setattr(
             tq_lifecycle.ray,
@@ -449,11 +465,12 @@ def test_owner_start_boundary(monkeypatch: pytest.MonkeyPatch, outcome: str) -> 
         )
         monkeypatch.setattr(tq_lifecycle, "_stop_owner_actor", lambda handle, **_kwargs: stopped.append(handle))
         with pytest.raises(RuntimeError, match="owner creation failed"):
-            tq_lifecycle._start_owner(timeout=0.1)
+            tq_lifecycle._start_owner(conf, timeout=0.1)
         assert stopped == [owner]
     else:
         monkeypatch.setattr(tq_lifecycle.ray, "get", lambda *_args, **_kwargs: None)
-        assert tq_lifecycle._start_owner(timeout=0.1) is owner
+        assert tq_lifecycle._start_owner(conf, timeout=0.1) is owner
+    options.assert_called_once_with(resources={required_node_resource: 1} if required_node_resource else None)
 
 
 def test_owner_initialize_success_timeout_and_exception_cleanup(monkeypatch: pytest.MonkeyPatch) -> None:

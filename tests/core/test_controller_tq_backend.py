@@ -168,34 +168,61 @@ def test_capacity_failure_builds_fallback_only_in_auto(monkeypatch: pytest.Monke
         warning.assert_not_called()
 
 
-def test_initialized_data_system_keeps_simple_storage_unbounded(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("stage", ["off", "precondition", "initialize", "attach", "success"])
+@pytest.mark.parametrize("required_node_resource", [None, "stable_cpu"])
+def test_initialized_data_system_preserves_storage_and_affinity(
+    monkeypatch: pytest.MonkeyPatch, stage: str, required_node_resource: str | None
+) -> None:
     instance = controller.Controller.__new__(controller.Controller)
     instance.config = _config(
-        tq_rdma_mode="off",
+        tq_rdma_mode="off" if stage == "off" else "auto",
         fully_async=False,
         balance_data=False,
         polling_mode=False,
     )
     instance._tq_owner = None
     instance._tq_legacy_init = False
-    captured: dict[str, Any] = {}
+    configs: list[Any] = []
+    closed: list[Any] = []
+    _DecisionHarness(monkeypatch, "master" if stage == "precondition" else None)
 
     monkeypatch.setattr(controller, "resolve_sft_algo_key", lambda _config: "grpo")
     monkeypatch.setattr(controller, "compute_dp_size", lambda _config: 1)
     monkeypatch.setattr(controller, "IdentityWindowSampler", lambda **_kwargs: object())
     monkeypatch.setattr(controller, "reap_unusable_tq_controller", lambda: None)
+    monkeypatch.setattr(
+        controller,
+        "with_control_plane_affinity",
+        lambda _: {"resources": {required_node_resource: 1}} if required_node_resource else {},
+    )
+    monkeypatch.setattr(controller, "verify_cluster_attach", lambda _: ["timeout"] if stage == "attach" else [])
+    monkeypatch.setattr(controller, "close_tq_owner", closed.append)
 
     def init(conf: Any) -> Any:
-        captured["conf"] = conf
+        configs.append(conf)
         return conf
 
+    def initialize(conf: Any, *, mode: str, fallback_conf: Any = None) -> Any:
+        configs.append(conf)
+        if fallback_conf is not None:
+            configs.append(fallback_conf)
+        return controller.TqInitResult(
+            config=fallback_conf if stage == "initialize" else conf,
+            owner="simple-owner" if stage == "initialize" or _is_simple(conf.backend) else "mooncake-owner",
+        )
+
     monkeypatch.setattr(controller.tq, "init", init)
+    monkeypatch.setattr(controller, "initialize_tq_with_fallback", initialize)
 
     instance._initialize_data_system()
 
-    backend = captured["conf"]["backend"]
-    assert _is_simple(backend)
-    assert backend["SimpleStorage"]["total_storage_size"] is None
+    for conf in configs:
+        assert conf.controller.required_node_resource == required_node_resource
+        if "SimpleStorage" in conf.backend:
+            assert conf.backend.SimpleStorage.required_node_resource == required_node_resource
+            assert conf.backend.SimpleStorage.total_storage_size is None
+    assert _is_simple(instance.config.tq_config.backend) is (stage != "success")
+    assert closed == (["mooncake-owner"] if stage == "attach" else [])
 
 
 def test_cli_exposes_only_mode_and_device(arguments_module: Any) -> None:
