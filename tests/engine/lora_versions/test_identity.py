@@ -6,8 +6,8 @@ import json
 import pytest
 import torch
 
-from relax.backends.sglang.lora_versions.identity import snapshot_adapter, tensor_fingerprint
-from relax.backends.sglang.lora_versions.manager import LoRAVersionManager, PublicationError, Replica, SessionKey
+from relax.engine.lora_versions.identity import snapshot_adapter, tensor_fingerprint
+from relax.engine.lora_versions.manager import LoRAVersionManager, PublicationError, Replica, SessionKey
 
 
 def test_snapshot_owns_storage_and_metadata():

@@ -12,8 +12,8 @@ from dataclasses import replace
 
 import pytest
 
-from relax.backends.sglang.lora_versions.identity import VersionIdentity
-from relax.backends.sglang.lora_versions.manager import (
+from relax.engine.lora_versions.identity import VersionIdentity
+from relax.engine.lora_versions.manager import (
     CleanupObservation,
     LoRAVersionManager,
     PublicationError,
@@ -252,6 +252,60 @@ def test_cleanup_requires_stop_fence_and_matching_instance(manager):
     assert manager.publication(0).absent_engines == ("e0",)
 
 
+@pytest.mark.parametrize("regression", ["fence", "admission", "requests"])
+def test_cleanup_rejects_whole_regressive_observations(manager, regression):
+    a = publish(manager, 0)
+    publish(manager, 1)
+    replica = a.verified[0]
+    draining = cleanup_observation(a, "e0", lora_id=replica.lora_id, requests=1)
+    assert manager.observe_cleanup(0, a.attempt_id, draining)
+    stale = {
+        "fence": replace(draining, attempt_fenced=False, requests=0),
+        "admission": replace(draining, admission_closed=False, requests=0),
+        "requests": replace(draining, requests=2),
+    }[regression]
+    assert not manager.observe_cleanup(0, a.attempt_id, stale)
+    assert not manager.unload_candidates(0)
+    assert manager.observe_cleanup(0, a.attempt_id, replace(draining, requests=0))
+    assert manager.unload_candidates(0) == (replica,)
+    assert not manager.observe_cleanup(0, a.attempt_id, draining)
+    assert manager.unload_candidates(0) == (replica,)
+    assert manager.occupied_versions == 2
+
+
+@pytest.mark.parametrize(("closed", "fenced"), [(False, True), (True, False)])
+def test_cleanup_keeps_snapshot_fields_together_and_allows_pre_drain_growth(manager, closed, fenced):
+    a = publish(manager, 0)
+    publish(manager, 1)
+    replica = a.verified[0]
+    before_stop = cleanup_observation(a, "e0", lora_id=replica.lora_id, requests=0, closed=closed, fenced=fenced)
+    assert manager.observe_cleanup(0, a.attempt_id, before_stop)
+    assert not manager.unload_candidates(0)
+    stopped = replace(before_stop, requests=2, admission_closed=True, attempt_fenced=True)
+    assert manager.observe_cleanup(0, a.attempt_id, stopped)
+    assert not manager.unload_candidates(0)
+    # The earlier zero count cannot be combined with the later closed flag.
+    assert not manager.observe_cleanup(0, a.attempt_id, before_stop)
+    assert not manager.unload_candidates(0)
+    assert manager.observe_cleanup(0, a.attempt_id, replace(stopped, requests=0))
+    assert manager.unload_candidates(0) == (replica,)
+
+
+def test_cleanup_does_not_merge_complementary_close_and_fence_flags(manager):
+    a = publish(manager, 0)
+    publish(manager, 1)
+    replica = a.verified[0]
+    closed_only = cleanup_observation(a, "e0", lora_id=replica.lora_id, requests=2, fenced=False)
+    fenced_only = replace(closed_only, requests=0, admission_closed=False, attempt_fenced=True)
+    assert manager.observe_cleanup(0, a.attempt_id, closed_only)
+    assert not manager.observe_cleanup(0, a.attempt_id, fenced_only)
+    assert not manager.unload_candidates(0)
+    assert manager.observe_cleanup(0, a.attempt_id, replace(closed_only, attempt_fenced=True))
+    assert not manager.unload_candidates(0)
+    assert manager.observe_cleanup(0, a.attempt_id, replace(closed_only, attempt_fenced=True, requests=0))
+    assert manager.unload_candidates(0) == (replica,)
+
+
 def test_engine_restart_invalidates_receipts_and_requires_recovery(manager):
     a = publish(manager, 0)
     key = SessionKey("s", "s0", 0)
@@ -336,6 +390,30 @@ def test_shard_death_releases_all_bindings_without_reviving_old_instances(manage
         manager.register_shard("s", "s1")
 
 
+def test_reclamation_waits_for_references_from_every_shard(manager):
+    a = publish(manager, 0)
+    manager.register_shard("t", "t0")
+    first = SessionKey("s", "s0", 0)
+    other = SessionKey("t", "t0", 0)
+    assert manager.bind(first) == manager.bind(other) == identity(0)
+    assert manager.publication(0).session_count == 2
+    publish(manager, 1)
+    assert manager.close_shard("s", "s0")
+    assert manager.publication(0).session_count == 1
+    assert manager.publication(0).state is VersionState.RETIRED
+    assert not manager.observe_cleanup(0, a.attempt_id, cleanup_observation(a, "e0"))
+    with pytest.raises(PublicationError, match="CAPACITY_EXHAUSTED"):
+        manager.reserve(identity(2), FINGERPRINTS)
+    manager.register_shard("s", "s1", expected_instance="s0")
+    assert manager.bind(SessionKey("s", "s1", 0)) == identity(1)
+    assert manager.bind(other) == identity(0)
+    assert not manager.release(first)
+    assert manager.publication(0).session_count == 1
+    assert manager.release(other)
+    assert manager.publication(0).state is VersionState.DRAINING
+    assert manager.publication(1).session_count == 1
+
+
 def test_aborted_old_version_cannot_roll_default_back(manager):
     publish(manager, 0)
     b = manager.reserve(identity(1), FINGERPRINTS).publication
@@ -361,22 +439,28 @@ def test_seeded_event_interleavings():
     """Replay with RELAX_LORA_TEST_SEED_START and RELAX_LORA_TEST_SEEDS.
 
     Keep normal CI bounded; the RFC acceptance run uses 100000 seeds. An
-    independent binding ledger checks counts after every reordered event.
+    independent binding ledger checks counts after every reordered event, with
+    two shards sharing versions and restarting independently.
     """
     start = int(os.environ.get("RELAX_LORA_TEST_SEED_START", "0"))
     seeds = int(os.environ.get("RELAX_LORA_TEST_SEEDS", "128"))
     for seed in range(start, start + seeds):
         rng = random.Random(seed)
         manager = LoRAVersionManager(ENGINES)
-        manager.register_shard("s", "s0")
         publish(manager, 0)
         bindings = {}
+        shard_epochs = {"s": 0, "t": 0}
+        for shard_id in shard_epochs:
+            manager.register_shard(shard_id, f"{shard_id}0")
+            key = SessionKey(shard_id, f"{shard_id}0", 0)
+            assert manager.bind(key) == identity(0)
+            bindings[key] = 0
+        session_keys = list(bindings)
         closed = set()
         attempts = [manager.publication(0)]
         trace = []
         next_version = 1
         previous_default = 0
-        shard_epoch = 0
         engine_epochs = dict(ENGINES)
         for step in range(64):
             action = rng.choice(
@@ -389,7 +473,12 @@ def test_seeded_event_interleavings():
                 + ["cleanup"] * 4
                 + ["restart", "death"]
             )
-            key = SessionKey("s", f"s{shard_epoch}", rng.randrange(8))
+            shard_id = rng.choice(tuple(shard_epochs))
+            shard_instance = f"{shard_id}{shard_epochs[shard_id]}"
+            key = SessionKey(shard_id, shard_instance, rng.randrange(8))
+            if action in ("bind", "release") and rng.random() < 0.2:
+                key = rng.choice(session_keys)
+            session_keys.append(key)
             current = [manager.publication(v) for v in sorted({p.identity.version_id for p in attempts})]
             eligible = [
                 p
@@ -459,10 +548,15 @@ def test_seeded_event_interleavings():
                         manager.replace_engine(engine, engine_epochs[engine], new_instance)
                         engine_epochs[engine] = new_instance
                     else:
-                        manager.close_shard("s", f"s{shard_epoch}")
-                        bindings.clear()
-                        manager.register_shard("s", f"s{shard_epoch + 1}", expected_instance=f"s{shard_epoch}")
-                        shard_epoch += 1
+                        manager.close_shard(shard_id, shard_instance)
+                        retired = [key for key in bindings if key.shard_id == shard_id]
+                        for retired_key in retired:
+                            del bindings[retired_key]
+                        closed.update(retired)
+                        shard_epochs[shard_id] += 1
+                        manager.register_shard(
+                            shard_id, f"{shard_id}{shard_epochs[shard_id]}", expected_instance=shard_instance
+                        )
                 except PublicationError as error:
                     assert error.code in {
                         "CAPACITY_EXHAUSTED",

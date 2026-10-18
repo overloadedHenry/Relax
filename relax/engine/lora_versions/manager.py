@@ -272,6 +272,9 @@ class LoRAVersionManager:
         Callers fence *every* target, even when a load reply was lost. Engine
         fencing and stop-admission are monotonic within an attempt; once both
         hold, request counts can only decrease and no new instance can load.
+        Reject an entire regressive observation rather than combining fields
+        from different snapshots. Engine observations must still be truthful
+        and internally consistent; this is not a substitute for engine fencing.
         """
         v = self._versions[version_id]
         o = observation
@@ -286,9 +289,17 @@ class LoRAVersionManager:
         known_id = verified.lora_id if verified is not None else (previous.lora_id if previous is not None else None)
         if o.lora_id is not None and known_id is not None and o.lora_id != known_id:
             return False
-        # A delayed pre-fence inventory must not undo a confirmed absence.
-        if previous is not None and previous.lora_id is None and previous.attempt_fenced:
-            return False
+        if previous is not None:
+            # Keep confirmed absence and monotonic drain progress despite
+            # delayed inventory responses. Counts may grow before admission
+            # and loading are both closed, so do not take a running minimum.
+            if (
+                (previous.lora_id is None and previous.attempt_fenced)
+                or (previous.attempt_fenced and not o.attempt_fenced)
+                or (previous.admission_closed and not o.admission_closed)
+                or (previous.attempt_fenced and previous.admission_closed and o.requests > previous.requests)
+            ):
+                return False
         v.cleanup[o.engine_id] = o
         if all(
             engine in v.cleanup and v.cleanup[engine].lora_id is None and v.cleanup[engine].attempt_fenced
