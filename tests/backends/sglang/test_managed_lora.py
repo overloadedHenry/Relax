@@ -566,8 +566,11 @@ async def test_managed_name_never_implicitly_reloads(runtime):
     manager.load_lora_adapter.assert_not_called()
 
 
-@pytest.mark.parametrize("failure", ["other_rank", "fingerprint", "local_exception"])
-def test_tp_collective_rejects_partial_or_inconsistent_load(runtime, failure):
+@pytest.mark.parametrize(
+    ("failure", "tp_size"),
+    [(None, 1), (None, 2), ("other_rank", 2), ("fingerprint", 2), ("local_exception", 2)],
+)
+def test_tp_collective_uses_parallel_state_and_checks_all_ranks(runtime, failure, tp_size):
     path = sglang_source_path("srt/managers/scheduler.py")
     tree = ast.parse(path.read_text())
     cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "Scheduler")
@@ -580,15 +583,19 @@ def test_tp_collective_rejects_partial_or_inconsistent_load(runtime, failure):
 
     def gather(results, value, **kwargs):
         assert kwargs["group"] is group
-        results[:] = [value, remote]
+        assert len(results) == tp_size
+        results[:] = [value] + [remote] * (tp_size - 1)
 
     operation = Mock(return_value=local)
     if failure == "local_exception":
         operation.side_effect = ValueError("receiver validation failed")
     ns = {"torch": SimpleNamespace(distributed=SimpleNamespace(all_gather_object=Mock(side_effect=gather)))}
+    ns.update(dataclass=dataclasses.dataclass, Optional=typing.Optional)
+    definitions("srt/distributed/parallel_state_wrapper.py", ["ParallelState"], ns)
     exec(compile(ast.Module(body=[method], type_ignores=[]), str(path), "exec"), ns)
-    result = ns["_managed_lora_update"](SimpleNamespace(tp_size=2, tp_cpu_group=group), operation, object())
-    assert not result.success
+    scheduler = SimpleNamespace(ps=ns["ParallelState"].trivial(tp_size=tp_size), tp_cpu_group=group)
+    result = ns["_managed_lora_update"](scheduler, operation, object())
+    assert result.success is (failure is None)
     ns["torch"].distributed.all_gather_object.assert_called_once()
 
 
@@ -645,3 +652,81 @@ async def test_parallel_sampling_acquires_once_per_logical_prompt(runtime):
         manager._remove_req_state(rid)
     await asyncio.gather(*manager._lora_release_tasks)
     assert [manager.lora_registry.request_count(ref.lora_id) for ref in refs] == [0, 0]
+
+
+@pytest.mark.parametrize("model_type", ["qwen3", "qwen3_5"])
+def test_gpu_fixture_derives_identity_and_reproducible_adapters(tmp_path, monkeypatch, model_type):
+    from safetensors.torch import save_file
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from tokenizers.pre_tokenizers import Whitespace
+    from transformers import PreTrainedTokenizerFast
+
+    from .test_managed_lora_gpu import lora_fixture
+
+    # Only fixture preparation runs here: no server, CUDA allocation or inference.
+    config = {
+        "model_type": "qwen3",
+        "hidden_size": 1024,
+        "num_hidden_layers": 28,
+        "num_attention_heads": 16,
+        "num_key_value_heads": 8,
+        "head_dim": 128,
+    }
+    if model_type == "qwen3_5":
+        config = {
+            "model_type": model_type,
+            "text_config": {"hidden_size": 1024, "num_hidden_layers": 24, "intermediate_size": 3584},
+        }
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    tokenizer = Tokenizer(WordLevel({"[UNK]": 0, "Continue": 1}, unk_token="[UNK]"))
+    tokenizer.pre_tokenizer = Whitespace()
+    PreTrainedTokenizerFast(tokenizer_object=tokenizer, unk_token="[UNK]").save_pretrained(tmp_path)
+    save_file({"fixture": torch.zeros(1)}, str(tmp_path / "model.safetensors"))
+    monkeypatch.setenv("RELAX_LORA_TEST_MODEL", str(tmp_path))
+    first = lora_fixture.__wrapped__()
+    a, b = first.old.copy_tensors(), first.new.copy_tensors()
+    if model_type == "qwen3":
+        assert len(a) == 112
+        assert a["model.layers.0.self_attn.q_proj.lora_B.weight"].shape == (2048, 8)
+        assert a["model.layers.0.self_attn.v_proj.lora_B.weight"].shape == (1024, 8)
+    else:
+        assert len(a) == 96
+        assert first.old.config["target_modules"] == ["gate_proj", "up_proj"]
+        for layer in range(24):
+            for module in ("gate_proj", "up_proj"):
+                assert a[f"model.layers.{layer}.mlp.{module}.lora_A.weight"].shape == (8, 1024)
+                assert a[f"model.layers.{layer}.mlp.{module}.lora_B.weight"].shape == (3584, 8)
+    for name in a:
+        assert torch.equal(b[name], -a[name] if ".lora_B." in name else a[name])
+    assert first.probe_ids and first.score_prefix and first.score_suffix
+    assert first.old.identity.digest != first.new.identity.digest
+    save_file({"fixture": torch.ones(1)}, str(tmp_path / "model.safetensors"))
+    second = lora_fixture.__wrapped__()
+    assert first.old.fingerprints == second.old.fingerprints
+    assert first.old.identity.digest != second.old.identity.digest
+
+
+@pytest.mark.asyncio
+async def test_gpu_fault_injection_changes_wire_manifest():
+    from .test_managed_lora_gpu import corrupt_lora_manifest
+
+    async def receiver(scope, receive, send):
+        wire = b""
+        while True:
+            message = await receive()
+            wire += message.get("body", b"")
+            if not message.get("more_body", False):
+                break
+        assert json.loads(wire)["relax_manifest"] == "{} "
+        assert int(dict(scope["headers"])[b"content-length"]) == len(wire)
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"ok"})
+
+    async with httpx.AsyncClient(
+        base_url="http://engine",
+        transport=httpx.ASGITransport(app=receiver),
+        event_hooks={"request": [corrupt_lora_manifest]},
+    ) as client:
+        response = await client.post("/relax/lora/load", json={"relax_manifest": "{}"})
+        assert response.status_code == 200

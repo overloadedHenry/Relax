@@ -3906,7 +3906,7 @@ index 1c5bf17..9e14502 100644
      error_message: Optional[str] = None
      loaded_adapters: Optional[Dict[str, Union[str, LoRARef]]] = None
 diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
-index aca7bd7..2178925 100644
+index aca7bd7..d9631b1 100644
 --- a/python/sglang/srt/managers/scheduler.py
 +++ b/python/sglang/srt/managers/scheduler.py
 @@ -4687,8 +4687,9 @@ class Scheduler(
@@ -3938,7 +3938,7 @@ index aca7bd7..2178925 100644
 +            result = operation(req)
 +        except Exception as exc:
 +            result = LoRAUpdateOutput(success=False, error_message=str(exc))
-+        results = [None] * self.tp_size
++        results = [None] * self.ps.tp_size
 +        torch.distributed.all_gather_object(results, result, group=self.tp_cpu_group)
 +        errors = [r.error_message or "worker failed" for r in results if not r.success]
 +        if errors:
