@@ -172,18 +172,50 @@ class LoRAPublisher:
                     del self.snapshots[version_id]
             return errors
 
-    async def replace_engine(self, engine_id: str, old_instance: str, new_instance: str) -> None:
+    async def replace_engine(
+        self,
+        engine_id: str,
+        old_instance: str,
+        new_instance: str,
+        *,
+        client: "SGLangLoRAClient | None" = None,
+    ) -> None:
         """Host must first confirm the old process exited, not just timed out.
 
         Reload all bindable/bound snapshots before the replacement can serve.
         Retry after a lost ACK or probe failure. A definitive backend load
-        failure requires another process replacement before loading again.
+        failure requires another process replacement before loading again. Pass
+        a changed endpoint as ``client`` instead of mutating ``engines``.
         """
-        if self.manager.replace_engine(engine_id, old_instance, new_instance):
-            self.engines[engine_id].forget_replaced_instance(old_instance)
-        for version_id in tuple(self.snapshots):
-            publication = self.manager.publication(version_id)
-            if publication.state in (VersionState.PUBLISHED, VersionState.RETIRED):
+        # Keep the same lock order as publish's failure reconciliation.
+        async with self._publish_lock, self._reconcile_lock:
+            replaced = self.manager.replace_engine(engine_id, old_instance, new_instance)
+            if not replaced and self.manager.engine_instance(engine_id) != new_instance:
+                raise PublicationError("ENGINE_INSTANCE_MISMATCH", "replacement lost the instance CAS")
+            if not replaced and client is not None and client is not self.engines[engine_id]:
+                raise PublicationError("ENGINE_INSTANCE_MISMATCH", "replacement retry must retain its client")
+            if replaced:
+                self.engines[engine_id].forget_replaced_instance(old_instance)
+            if client is not None:
+                self.engines[engine_id] = client
+            for version_id in tuple(self.snapshots):
+                publication = self.manager.publication(version_id)
+                if publication.state not in (VersionState.PUBLISHED, VersionState.RETIRED):
+                    continue
                 if dict(publication.targets)[engine_id] != new_instance:
                     raise PublicationError("ENGINE_INSTANCE_MISMATCH", "replacement lost the instance CAS")
-                await self._verify(publication, engine_id, new_instance)
+                try:
+                    await self._verify(publication, engine_id, new_instance)
+                except PublicationError as exc:
+                    current = self.manager.publication(version_id)
+                    # Session release is synchronous and does not take these
+                    # locks. A fully checked replica may become unnecessary
+                    # while I/O yields; leave it for the next cleanup pass.
+                    if not (
+                        exc.code == "STALE_ATTEMPT"
+                        and publication.state is VersionState.RETIRED
+                        and current.state is VersionState.DRAINING
+                        and current.attempt_id == publication.attempt_id
+                        and dict(current.targets)[engine_id] == new_instance
+                    ):
+                        raise

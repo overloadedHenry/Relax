@@ -481,9 +481,8 @@ async def test_instance_replacement_recovers_before_serving_and_rejects_stale_co
     publisher = await LoRAPublisher.connect({"e": old_engine.client}, [1])
     await publisher.publish(snapshot())
     old_id, new_id = old_engine.relax_lora.instance_id, new_engine.relax_lora.instance_id
-    publisher.engines["e"] = new_engine.client
     new_engine.resume.clear()
-    task = asyncio.create_task(publisher.replace_engine("e", old_id, new_id))
+    task = asyncio.create_task(publisher.replace_engine("e", old_id, new_id, client=new_engine.client))
     await new_engine.entered.wait()
     assert publisher.manager.serving_engines == ()
     with pytest.raises(httpx.HTTPStatusError):
@@ -491,6 +490,193 @@ async def test_instance_replacement_recovers_before_serving_and_rejects_stale_co
     new_engine.resume.set()
     await task
     assert publisher.manager.serving_engines == ("e",)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fail_load", [False, True])
+async def test_replacement_waits_for_publication_and_its_failure_cleanup(runtime, tmp_path, fail_load):
+    old, new = Engine(runtime), Engine(runtime)
+    publisher = await LoRAPublisher.connect({"e": old.client}, [1])
+    await publisher.publish(write_adapter_artifact(snapshot(), tmp_path))
+    old.entered.clear()
+    old.resume.clear()
+    old.fail_load = fail_load
+    publishing = asyncio.create_task(publisher.publish(write_adapter_artifact(snapshot(2), tmp_path)))
+    await old.entered.wait()
+    replacing = asyncio.create_task(
+        publisher.replace_engine("e", old.relax_lora.instance_id, new.relax_lora.instance_id, client=new.client)
+    )
+    await asyncio.sleep(0)
+    assert not replacing.done()
+    assert publisher.engines["e"] is old.client
+    assert publisher.manager.default_version == 1
+    old.resume.set()
+    if fail_load:
+        with pytest.raises(PublicationError, match="REPLICA_INVALID"):
+            await asyncio.wait_for(publishing, 5)
+    else:
+        await asyncio.wait_for(publishing, 5)
+    await asyncio.wait_for(replacing, 5)
+    assert publisher.manager.default_version == (1 if fail_load else 2)
+    assert publisher.engines["e"] is new.client
+    assert publisher.manager.serving_engines == ("e",)
+    assert new.loads == 1
+    await publisher.reconcile()
+    assert publisher.manager.occupied_versions == 1
+
+
+@pytest.mark.asyncio
+async def test_publication_waits_for_replacement_recovery(runtime, tmp_path):
+    old, new = Engine(runtime), Engine(runtime)
+    publisher = await LoRAPublisher.connect({"e": old.client}, [1])
+    await publisher.publish(write_adapter_artifact(snapshot(), tmp_path))
+    new.resume.clear()
+    replacing = asyncio.create_task(
+        publisher.replace_engine("e", old.relax_lora.instance_id, new.relax_lora.instance_id, client=new.client)
+    )
+    await new.entered.wait()
+    publishing = asyncio.create_task(publisher.publish(write_adapter_artifact(snapshot(2), tmp_path)))
+    await asyncio.sleep(0)
+    assert not publishing.done()
+    assert publisher.manager.default_version == 1
+    assert publisher.manager.occupied_versions == 1
+    assert publisher.manager.serving_engines == ()
+    new.resume.set()
+    await asyncio.wait_for(asyncio.gather(replacing, publishing), 5)
+    assert publisher.manager.default_version == 2
+    assert publisher.manager.serving_engines == ("e",)
+    assert old.loads == 1 and new.loads == 2
+
+
+@pytest.mark.asyncio
+async def test_replacement_waits_for_inflight_cleanup(runtime, tmp_path, monkeypatch):
+    old, new = Engine(runtime), Engine(runtime)
+    publisher = await LoRAPublisher.connect({"e": old.client}, [1])
+    await publisher.publish(write_adapter_artifact(snapshot(), tmp_path))
+    await publisher.publish(write_adapter_artifact(snapshot(2), tmp_path))
+    entered, resume = asyncio.Event(), asyncio.Event()
+    control = old.client.control
+
+    async def blocked_control(*args, **kwargs):
+        entered.set()
+        await resume.wait()
+        return await control(*args, **kwargs)
+
+    monkeypatch.setattr(old.client, "control", blocked_control)
+    cleaning = asyncio.create_task(publisher.reconcile())
+    await entered.wait()
+    replacing = asyncio.create_task(
+        publisher.replace_engine("e", old.relax_lora.instance_id, new.relax_lora.instance_id, client=new.client)
+    )
+    await asyncio.sleep(0)
+    assert not replacing.done()
+    assert publisher.engines["e"] is old.client
+    assert publisher.manager.engine_instance("e") == old.relax_lora.instance_id
+    resume.set()
+    assert await asyncio.wait_for(cleaning, 5) == {}
+    await asyncio.wait_for(replacing, 5)
+    assert publisher.manager.publication(1).state is VersionState.RECLAIMED
+    assert publisher.manager.serving_engines == ("e",)
+    assert new.loads == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [None, "fail_load", "fail_probe"])
+async def test_session_release_during_recovery_preserves_cleanup_and_real_errors(runtime, tmp_path, failure):
+    old, new = Engine(runtime), Engine(runtime)
+    publisher = await LoRAPublisher.connect({"e": old.client}, [1])
+    manager = publisher.manager
+    await publisher.publish(write_adapter_artifact(snapshot(), tmp_path))
+    manager.register_shard("s", "shard")
+    session = SessionKey("s", "shard", 0)
+    manager.bind(session)
+    await publisher.publish(write_adapter_artifact(snapshot(2), tmp_path))
+    new.resume.clear()
+    if failure:
+        setattr(new, failure, True)
+    replacing = asyncio.create_task(
+        publisher.replace_engine("e", old.relax_lora.instance_id, new.relax_lora.instance_id, client=new.client)
+    )
+    await new.entered.wait()
+    manager.release(session)
+    cleaning = asyncio.create_task(publisher.reconcile())
+    await asyncio.sleep(0)
+    assert manager.publication(1).state is VersionState.DRAINING
+    assert not cleaning.done()
+    assert new.unloads == 0
+    new.resume.set()
+    if failure:
+        with pytest.raises(ValueError, match="REPLICA_INVALID|probe did not produce"):
+            await asyncio.wait_for(replacing, 5)
+        assert manager.serving_engines == ()
+        assert new.loads == 1
+    else:
+        await asyncio.wait_for(replacing, 5)
+        assert manager.serving_engines == ("e",)
+        assert new.loads == 2
+    assert await asyncio.wait_for(cleaning, 5) == {}
+    assert manager.default_version == 2
+    assert manager.publication(1).state is VersionState.RECLAIMED
+    assert new.unloads == 1
+
+
+@pytest.mark.asyncio
+async def test_cancelled_replacement_retries_without_losing_payloads_or_locks(runtime, tmp_path):
+    old, new = Engine(runtime), Engine(runtime)
+    publisher = await LoRAPublisher.connect({"e": old.client}, [1])
+    await publisher.publish(write_adapter_artifact(snapshot(), tmp_path))
+    old_id, new_id = old.relax_lora.instance_id, new.relax_lora.instance_id
+    # Retention belongs to the old client even when the endpoint changes.
+    old.client._payloads[(old_id, "old", 1)] = ({}, "owned")
+    new.resume.clear()
+    replacing = asyncio.create_task(publisher.replace_engine("e", old_id, new_id, client=new.client))
+    await new.entered.wait()
+    assert old.client._payloads == {}
+    replacing.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await replacing
+    assert publisher.manager.serving_engines == ()
+    assert await asyncio.wait_for(publisher.reconcile(), 5) == {}
+    new.client._payloads[(new_id, "retained", 1)] = ({}, "owned")
+    new.resume.set()
+    await asyncio.wait_for(publisher.replace_engine("e", old_id, new_id, client=new.client), 5)
+    assert publisher.manager.serving_engines == ("e",)
+    assert new.loads == 1
+    assert (new_id, "retained", 1) in new.client._payloads
+    with pytest.raises(PublicationError, match="ENGINE_INSTANCE_MISMATCH"):
+        await publisher.replace_engine("e", old_id, new_id, client=old.client)
+    assert publisher.engines["e"] is new.client
+
+
+@pytest.mark.asyncio
+async def test_stale_replacement_cannot_change_client_without_snapshots(runtime):
+    old, new, stale = Engine(runtime), Engine(runtime), Engine(runtime)
+    publisher = await LoRAPublisher.connect({"e": old.client}, [1])
+    old_id, new_id = old.relax_lora.instance_id, new.relax_lora.instance_id
+    await publisher.replace_engine("e", old_id, new_id, client=new.client)
+    with pytest.raises(PublicationError, match="ENGINE_INSTANCE_MISMATCH"):
+        await publisher.replace_engine("e", old_id, stale.relax_lora.instance_id, client=stale.client)
+    assert publisher.manager.engine_instance("e") == new_id
+    assert publisher.engines["e"] is new.client
+
+
+@pytest.mark.asyncio
+async def test_same_endpoint_replacement_retries_probe_without_reloading(runtime, tmp_path):
+    old, new = Engine(runtime), Engine(runtime)
+    publisher = await LoRAPublisher.connect({"e": old.client}, [1])
+    await publisher.publish(write_adapter_artifact(snapshot(), tmp_path))
+    await old.client.http.aclose()
+    old.client.http = httpx.AsyncClient(base_url="http://engine", transport=httpx.MockTransport(new.http))
+    old_id, new_id = old.relax_lora.instance_id, new.relax_lora.instance_id
+    new.fail_probe = True
+    with pytest.raises(ValueError, match="probe did not produce"):
+        await publisher.replace_engine("e", old_id, new_id)
+    assert publisher.manager.serving_engines == ()
+    new.fail_probe = False
+    await publisher.replace_engine("e", old_id, new_id)
+    assert publisher.engines["e"] is old.client
+    assert publisher.manager.serving_engines == ("e",)
+    assert new.loads == 1
 
 
 @pytest.mark.parametrize("corruption", ["bytes", "dtype", "shape", "config"])

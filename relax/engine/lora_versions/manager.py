@@ -141,6 +141,10 @@ class LoRAVersionManager:
     def default_version(self) -> int | None:
         return self._default
 
+    def engine_instance(self, engine_id: str) -> str:
+        """Return the current process identity for replacement CAS retries."""
+        return self._engines[engine_id]
+
     @property
     def occupied_versions(self) -> int:
         return sum(v.state not in (VersionState.ABORTED, VersionState.RECLAIMED) for v in self._versions.values())
