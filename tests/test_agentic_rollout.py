@@ -456,7 +456,7 @@ def test_finish_eligibility_uses_physical_debt_and_interrupted_resident_groups(
     expected: bool,
 ) -> None:
     pipeline = object.__new__(AgenticResidentPipeline)
-    pipeline.args = SimpleNamespace(fully_async=fully_async)
+    pipeline.args = SimpleNamespace(fully_async=fully_async, max_staleness=1)
     pipeline.transfer_domain = SimpleNamespace(total_debt=debt, previous_debt=previous_debt)
     pipeline.runtime_domain = SimpleNamespace(interrupted_group_ids=tuple(range(interrupted_count)))
 
