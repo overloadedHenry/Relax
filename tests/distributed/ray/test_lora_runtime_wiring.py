@@ -24,6 +24,8 @@ def wiring(monkeypatch):
     manager.args.use_fault_tolerance = False
     manager._lora_runtime = None
     manager._lora_configuring = False
+    manager._lora_training_config = None
+    manager._generation_started = False
     manager._stop_eviction_monitor = lambda **_kwargs: None
     manager._shutdown_all_engines = lambda: events.append("engines-close")
     host = SimpleNamespace(
@@ -99,3 +101,82 @@ def test_lora_configuration_rejects_generation_that_already_started(wiring):
     with pytest.raises(RuntimeError, match="before generation"):
         manager.configure_lora_versions("artifact", [1])
     assert not events
+
+
+def prepare_training(manager, tmp_path):
+    manager.args.fully_async = True
+    manager.args.hybrid = manager.args.colocate = manager.args.offload_rollout = False
+    manager.args.lora_adapter_mode = True
+    next(iter(manager.servers.values())).engines[0]._actor_id.hex.return_value = "engine-id"
+    return manager.configure_lora_training(str(tmp_path), "frozen-base", [1])
+
+
+def test_training_configuration_blocks_generation_until_initial_publication(wiring, tmp_path):
+    manager, host, events, _agentic, _factory = wiring
+    config = prepare_training(manager, tmp_path)
+    assert config.engine_actor_ids == ("engine-id",)
+    assert manager.get_lora_training_config() == config
+    assert not events
+    with pytest.raises(RuntimeError, match="has not completed"):
+        manager._begin_generation()
+    with pytest.raises(RuntimeError, match="fixed engine pool"):
+        manager.create_scale_out_request(num_replicas=2)
+    with pytest.raises(RuntimeError, match="owns the initial"):
+        manager.configure_lora_versions("artifact", [1])
+
+    def publish(path):
+        events.append("publish")
+        return SimpleNamespace(identity=SimpleNamespace(version_id=0))
+
+    host.publish.remote = publish
+    assert manager.publish_training_lora("artifact") == {"status": "published", "version_id": 0}
+    assert events == ["start", "publish", "sessions-bind"]
+    manager._begin_generation()
+    host.publish_for_training = SimpleNamespace(remote=Mock(return_value={"status": "capacity_skipped"}))
+    assert manager.publish_training_lora("next") == {"status": "capacity_skipped"}
+    host.publish_for_training.remote.assert_called_once_with("next")
+    assert events == ["start", "publish", "sessions-bind"]
+
+
+def test_failed_training_bootstrap_cannot_resume_unmanaged_generation(wiring, tmp_path):
+    manager, host, _events, _agentic, _factory = wiring
+    prepare_training(manager, tmp_path)
+    host.publish.remote = Mock(side_effect=RuntimeError("first publication failed"))
+    assert manager.publish_training_lora("artifact")["status"] == "failed"
+    assert manager.publish_training_lora("artifact")["status"] == "failed"
+    host.publish.remote.assert_called_once()
+    with pytest.raises(RuntimeError, match="incomplete"):
+        manager._begin_generation()
+
+
+@pytest.mark.parametrize(
+    "argument,value",
+    [
+        ("fully_async", False),
+        ("hybrid", True),
+        ("colocate", True),
+        ("offload_rollout", True),
+        ("train_backend", "fsdp"),
+    ],
+)
+def test_training_configuration_rejects_unsupported_modes(wiring, tmp_path, argument, value):
+    manager, _host, events, _agentic, _factory = wiring
+    manager.args.fully_async = True
+    manager.args.hybrid = manager.args.colocate = manager.args.offload_rollout = False
+    manager.args.lora_adapter_mode = True
+    setattr(manager.args, argument, value)
+    with pytest.raises(ValueError, match="fully-async"):
+        manager.configure_lora_training(str(tmp_path), "base", [1])
+    assert manager._lora_training_config is None and not events
+
+
+def test_publication_and_disposal_share_a_group_separate_from_generation():
+    from relax.distributed.ray.rollout import RolloutManager
+
+    groups = RolloutManager.__ray_metadata__.method_meta.concurrency_group_for_methods
+    publication_group = groups["publish_training_lora"]
+    assert all(
+        groups[method] == publication_group
+        for method in ("configure_lora_training", "configure_lora_versions", "dispose")
+    )
+    assert groups.get("generate") != publication_group

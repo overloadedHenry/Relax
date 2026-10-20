@@ -124,3 +124,31 @@ async def test_runtime_retries_failed_shutdown_without_releasing_early():
     await host.close()
     assert manager.publication(0).session_count == 0
     client.aclose.assert_awaited_once()
+
+
+async def test_training_publication_accepts_only_committed_default():
+    host, manager = host_with_version()
+    host.publish = AsyncMock(return_value=manager.publication(0))
+    assert await host.publish_for_training("artifact") == {
+        "status": "published",
+        "version_id": 0,
+        "default_version": 0,
+    }
+    # A duplicate reserve can return an existing loading/aborting publication.
+    pending = manager.reserve(identity(1), {"a": 1}).publication
+    host.publish.return_value = pending
+    assert (await host.publish_for_training("artifact"))["status"] == "unconfirmed"
+    manager.cancel(1, pending.attempt_id)
+    host.publish.return_value = manager.publication(1)
+    assert (await host.publish_for_training("artifact"))["status"] == "unconfirmed"
+
+
+@pytest.mark.parametrize("has_default", [False, True])
+async def test_training_capacity_is_nonfatal_only_after_initial_publication(has_default):
+    host, manager = host_with_version()
+    if not has_default:
+        host._publisher.manager = LoRAVersionManager(ENGINES)
+    host.publish = AsyncMock(side_effect=PublicationError("CAPACITY_EXHAUSTED", "full"))
+    result = await host.publish_for_training("artifact")
+    assert result["status"] == ("capacity_skipped" if has_default else "failed")
+    assert result["default_version"] == (0 if has_default else None)

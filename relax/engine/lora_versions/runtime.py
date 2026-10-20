@@ -13,7 +13,7 @@ from relax.backends.sglang.lora_client import SGLangLoRAClient
 
 from .artifact import read_adapter_artifact
 from .identity import VersionIdentity
-from .manager import PublicationError, SessionKey
+from .manager import PublicationError, SessionKey, VersionState
 from .publisher import LoRAPublisher
 
 
@@ -106,6 +106,35 @@ class LoRAVersionRuntime:
         self._track_operation(task)
         # A cancelled RPC must not orphan a still-running publication.
         return await asyncio.shield(task)
+
+    async def publish_for_training(self, artifact_path: str) -> dict[str, Any]:
+        """Return a serializable verdict, including nonfatal capacity
+        pressure."""
+        try:
+            publication = await self.publish(artifact_path)
+        except PublicationError as error:
+            default = self._publisher.manager.default_version if self._publisher else None
+            return {
+                "status": (
+                    "capacity_skipped" if error.code == "CAPACITY_EXHAUSTED" and default is not None else "failed"
+                ),
+                "default_version": default,
+                "error": str(error),
+            }
+        except Exception as error:
+            return {"status": "failed", "error": f"{type(error).__name__}: {error}"}
+        default = self._publisher.manager.default_version
+        if publication.state is not VersionState.PUBLISHED or default != publication.identity.version_id:
+            return {
+                "status": "unconfirmed",
+                "default_version": default,
+                "error": f"publication is {publication.state.value}, not the committed default",
+            }
+        return {
+            "status": "published",
+            "version_id": publication.identity.version_id,
+            "default_version": default,
+        }
 
     async def register_shard(self, shard_id: str, instance_id: str, handle: Any) -> None:
         self._ready().manager.register_shard(shard_id, instance_id)
