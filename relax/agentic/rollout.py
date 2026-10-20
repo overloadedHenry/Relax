@@ -768,6 +768,10 @@ def bind_agentic_router(router_ip: str, router_port: int) -> None:
     _run_on_resident_async_loop(get_agentic_resident_pipeline().runtime_domain.bind_router(router_ip, router_port))
 
 
+def bind_agentic_lora_runtime(handle: Any) -> None:
+    _run_on_resident_async_loop(get_agentic_resident_pipeline().runtime_domain.bind_lora_runtime(handle))
+
+
 def _aggregate_agentic_timing(samples: list[Sample]) -> dict[str, float]:
     turns_by_sample = [sample.metadata[TRACE_KEY]["turns"] for sample in samples]
     if not turns_by_sample:
