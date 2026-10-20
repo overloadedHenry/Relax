@@ -25,6 +25,7 @@ import pytest
 import torch
 
 from relax.backends.sglang.lora_client import SGLangLoRAClient
+from relax.engine.lora_versions.artifact import AdapterArtifact, write_adapter_artifact
 from relax.engine.lora_versions.identity import snapshot_adapter, tensor_fingerprint
 from relax.engine.lora_versions.manager import PublicationError, SessionKey, VersionState
 from relax.engine.lora_versions.publisher import LoRAPublisher
@@ -130,6 +131,165 @@ def snapshot(version=1):
     )
 
 
+@pytest.mark.asyncio
+async def test_file_publication_waits_for_every_replica_and_retains_artifacts(runtime, tmp_path):
+    engines = [Engine(runtime), Engine(runtime)]
+    publisher = await LoRAPublisher.connect({str(i): e.client for i, e in enumerate(engines)}, [1])
+    old = write_adapter_artifact(snapshot(), tmp_path)
+    new = write_adapter_artifact(snapshot(2), tmp_path)
+    await publisher.publish(old)
+    for engine in engines:
+        engine.entered.clear()
+    engines[1].resume.clear()
+    task = asyncio.create_task(publisher.publish(new))
+    await engines[1].entered.wait()
+    assert publisher.manager.default_version == 1
+    assert not task.done()
+    engines[1].resume.set()
+    assert (await task).state == VersionState.PUBLISHED
+    assert publisher.manager.default_version == 2
+    await publisher.reconcile()
+    assert publisher.manager.publication(1).state == VersionState.RECLAIMED
+    assert old.path.is_dir() and new.path.is_dir()
+    assert all(not engine.client._payloads for engine in engines)
+
+
+@pytest.mark.asyncio
+async def test_file_missing_on_one_receiver_aborts_without_changing_default(runtime, tmp_path):
+    engines = [Engine(runtime), Engine(runtime)]
+    publisher = await LoRAPublisher.connect({str(i): e.client for i, e in enumerate(engines)}, [1])
+    await publisher.publish(write_adapter_artifact(snapshot(), tmp_path))
+    new = write_adapter_artifact(snapshot(2), tmp_path)
+    mounted = False
+
+    async def inaccessible_mount(request):
+        if request.url.path == "/relax/lora/load" and not mounted:
+            body = json.loads(request.content)
+            body["relax_artifact_path"] = str(tmp_path / "not-mounted-on-this-node")
+            request = httpx.Request(request.method, request.url, json=body)
+        return await engines[1].http(request)
+
+    await engines[1].client.http.aclose()
+    engines[1].client.http = httpx.AsyncClient(
+        base_url="http://engine", transport=httpx.MockTransport(inaccessible_mount)
+    )
+    with pytest.raises(PublicationError, match="REPLICA_INVALID"):
+        await publisher.publish(new)
+    assert publisher.manager.default_version == 1
+    assert publisher.manager.publication(2).state == VersionState.ABORTED
+    assert all(len(e.physical) == 1 for e in engines)
+    assert new.path.is_dir()
+    mounted = True
+    assert (await publisher.publish(new)).state == VersionState.PUBLISHED
+
+
+@pytest.mark.parametrize("damage", [None, "bytes", "identity", "missing", "two_sources"])
+def test_file_worker_validates_received_bytes_before_model_mutation(runtime, tmp_path, damage):
+    from safetensors.torch import save_file
+
+    frozen = snapshot()
+    artifact = write_adapter_artifact(frozen, tmp_path)
+    req = SimpleNamespace(
+        lora_name=frozen.identity.lora_name,
+        relax_artifact_path=str(artifact.path),
+        relax_attempt_id=1,
+        relax_manifest=artifact.manifest_json,
+        relax_digest=artifact.identity.digest,
+        config_dict=artifact.config,
+        serialized_named_tensors=[],
+        load_format=None,
+        added_tokens_config=None,
+        expected_checksums=None,
+        to_ref=lambda: object(),
+    )
+    if damage == "bytes":
+        tensors = frozen.copy_tensors()
+        tensors[next(iter(tensors))].add_(1)
+        save_file(tensors, str(artifact.path / "adapter_model.safetensors"))
+    elif damage == "identity":
+        req.lora_name = "relax_lora@99." + artifact.identity.digest[:12]
+    elif damage == "missing":
+        (artifact.path / "manifest.json").unlink()
+    elif damage == "two_sources":
+        req.serialized_named_tensors = [b"unexpected"]
+    path = sglang_source_path("srt/managers/tp_worker.py")
+    cls = next(n for n in ast.parse(path.read_text()).body if getattr(n, "name", None) == "BaseTpWorker")
+    method = next(n for n in cls.body if getattr(n, "name", None) == "load_lora_adapter_from_tensors")
+    ns = {"LoadLoRAAdapterFromTensorsReqInput": object}
+    exec(compile(ast.Module(body=[method], type_ignores=[]), str(path), "exec"), ns)
+    install = Mock(return_value=SimpleNamespace(success=True))
+    worker = SimpleNamespace(
+        model_runner=SimpleNamespace(load_lora_adapter_from_tensors=install),
+        _deserialize_own_rank=Mock(side_effect=AssertionError("file loading must not deserialize SHM")),
+    )
+    if damage is not None:
+        with pytest.raises((ValueError, FileNotFoundError)):
+            ns[method.name](worker, req)
+        install.assert_not_called()
+    else:
+        result = ns[method.name](worker, req)
+        assert result.fingerprints == frozen.fingerprints
+        received = install.call_args.args[1]
+        for name, tensor in frozen.copy_tensors().items():
+            assert torch.equal(received[name], tensor)
+        # The installed tensors retain owned bytes, independent of file changes.
+        save_file(
+            {name: tensor + 1 for name, tensor in received.items()}, str(artifact.path / "adapter_model.safetensors")
+        )
+        for name, tensor in frozen.copy_tensors().items():
+            assert torch.equal(received[name], tensor)
+
+
+def test_file_source_survives_http_validation_and_scheduler_ipc(runtime, tmp_path):
+    from pydantic import TypeAdapter
+
+    helper = {"__name__": "snapshot_schema_helpers"}
+    path = sglang_source_path("srt/utils/msgspec_utils.py")
+    exec(compile(path.read_text(), str(path), "exec"), helper)
+    ns = {
+        **vars(runtime),
+        "Any": typing.Any,
+        "Annotated": typing.Annotated,
+        "Base64Bytes": helper["Base64Bytes"],
+        "msgspec_struct_pydantic_core_schema": helper["msgspec_struct_pydantic_core_schema"],
+    }
+    definitions("srt/managers/io_struct.py", ["BaseReq", "LoadLoRAAdapterFromTensorsReqInput"], ns)
+    request_type = ns["LoadLoRAAdapterFromTensorsReqInput"]
+    artifact = write_adapter_artifact(snapshot(), tmp_path)
+    payload = {
+        "lora_name": artifact.identity.lora_name,
+        "config_dict": artifact.config,
+        "serialized_named_tensors": [],
+        "relax_artifact_path": str(artifact.path),
+        "relax_instance_id": "instance",
+        "relax_attempt_id": 1,
+        "relax_manifest": artifact.manifest_json,
+        "relax_digest": artifact.identity.digest,
+        "pinned": True,
+    }
+    parsed = TypeAdapter(request_type).validate_json(json.dumps(payload))
+    # The control layer assigns this ID before sending the request to workers.
+    parsed.lora_id = runtime.LoRARef(lora_name=parsed.lora_name, lora_path="__tensor__", pinned=True).lora_id
+    decoded = msgspec.msgpack.decode(msgspec.msgpack.encode(parsed), type=request_type)
+    assert decoded.relax_artifact_path == str(artifact.path)
+    assert decoded.serialized_named_tensors == []
+    assert decoded.relax_manifest == artifact.manifest_json
+    assert decoded.to_ref().pinned
+
+
+@pytest.fixture(params=["shm", "file"])
+def publication_source(request, tmp_path, runtime, monkeypatch):
+    if request.param == "shm":
+        request.getfixturevalue("shared_memory")
+        return snapshot
+    monkeypatch.setattr(
+        runtime.utils.MultiprocessingSerializer,
+        "serialize",
+        Mock(side_effect=AssertionError("file publication must not use shared memory")),
+    )
+    return lambda version=1: write_adapter_artifact(snapshot(version), tmp_path)
+
+
 class Engine:
     """Only the transport/GPU work is fake; control and reference tracking are
     real."""
@@ -173,7 +333,10 @@ class Engine:
             self.loads += 1
             self.entered.set()
             await self.resume.wait()
-            tensors = self.runtime.utils.MultiprocessingSerializer.deserialize(req.serialized_named_tensors[0])
+            if getattr(req, "relax_artifact_path", None):
+                tensors = self.runtime.control.read_artifact_tensors(req)
+            else:
+                tensors = self.runtime.utils.MultiprocessingSerializer.deserialize(req.serialized_named_tensors[0])
             fingerprints = self.runtime.control.verify_snapshot(req, tensors)
             self.physical[req.lora_id] = tensors
             return [
@@ -198,7 +361,10 @@ class Engine:
             if request.url.path == "/relax/lora/inventory":
                 result = self.relax_lora.inventory()
             elif request.url.path == "/relax/lora/load":
-                result = await self.relax_lora.load(SimpleNamespace(**json.loads(request.content)))
+                payload = json.loads(request.content)
+                payload.setdefault("load_format", None)
+                payload.setdefault("added_tokens_config", None)
+                result = await self.relax_lora.load(SimpleNamespace(**payload))
                 if self.lose_load_reply:
                     raise httpx.ReadTimeout("lost load reply")
             elif request.url.path == "/relax/lora/control":
@@ -216,7 +382,8 @@ class Engine:
 
 
 @pytest.mark.asyncio
-async def test_publish_all_replicas_then_drain_session_and_requests(runtime, shared_memory):
+async def test_publish_all_replicas_then_drain_session_and_requests(runtime, publication_source):
+    snapshot = publication_source
     engines = [Engine(runtime), Engine(runtime)]
     publisher = await LoRAPublisher.connect({str(i): e.client for i, e in enumerate(engines)}, [1])
     manager = publisher.manager
@@ -239,14 +406,15 @@ async def test_publish_all_replicas_then_drain_session_and_requests(runtime, sha
     assert manager.publication(1).state == VersionState.RECLAIMED
     assert manager.occupied_versions == 1
     assert all(e.loads == 2 and e.unloads == 1 for e in engines)
-    assert len(engines[0].client._payloads) == 1
+    assert len(engines[0].client._payloads) == (0 if isinstance(publisher.snapshots[2], AdapterArtifact) else 1)
     await publisher.publish(snapshot(2))
     assert all(e.loads == 2 for e in engines)
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure", ["fail_load", "fail_probe", "lose_load_reply"])
-async def test_failed_publication_keeps_default_and_cleans_every_target(runtime, shared_memory, failure):
+async def test_failed_publication_keeps_default_and_cleans_every_target(runtime, publication_source, failure):
+    snapshot = publication_source
     engines = [Engine(runtime), Engine(runtime)]
     publisher = await LoRAPublisher.connect({str(i): e.client for i, e in enumerate(engines)}, [1])
     await publisher.publish(snapshot(1))
@@ -259,7 +427,8 @@ async def test_failed_publication_keeps_default_and_cleans_every_target(runtime,
 
 
 @pytest.mark.asyncio
-async def test_cancel_during_load_fences_late_completion_and_retry(runtime, shared_memory):
+async def test_cancel_during_load_fences_late_completion_and_retry(runtime, publication_source):
+    snapshot = publication_source
     engine = Engine(runtime)
     publisher = await LoRAPublisher.connect({"e": engine.client}, [1])
     engine.resume.clear()
@@ -270,7 +439,7 @@ async def test_cancel_during_load_fences_late_completion_and_retry(runtime, shar
         await task
     assert publisher.manager.publication(1).state == VersionState.ABORTING
     assert publisher.manager.occupied_versions == 1
-    assert len(engine.client._payloads) == 1
+    assert len(engine.client._payloads) == (0 if isinstance(publisher.snapshots[1], AdapterArtifact) else 1)
     engine.resume.set()
     record = next(iter(engine.relax_lora.records.values()))
     await record.task
@@ -286,7 +455,8 @@ async def test_cancel_during_load_fences_late_completion_and_retry(runtime, shar
 
 
 @pytest.mark.asyncio
-async def test_unreachable_and_lost_unload_ack_hold_capacity_until_reconciled(runtime, shared_memory):
+async def test_unreachable_and_lost_unload_ack_hold_capacity_until_reconciled(runtime, publication_source):
+    snapshot = publication_source
     engine = Engine(runtime)
     publisher = await LoRAPublisher.connect({"e": engine.client}, [1])
     await publisher.publish(snapshot(1))
@@ -305,7 +475,8 @@ async def test_unreachable_and_lost_unload_ack_hold_capacity_until_reconciled(ru
 
 
 @pytest.mark.asyncio
-async def test_instance_replacement_recovers_before_serving_and_rejects_stale_control(runtime, shared_memory):
+async def test_instance_replacement_recovers_before_serving_and_rejects_stale_control(runtime, publication_source):
+    snapshot = publication_source
     old_engine, new_engine = Engine(runtime), Engine(runtime)
     publisher = await LoRAPublisher.connect({"e": old_engine.client}, [1])
     await publisher.publish(snapshot())

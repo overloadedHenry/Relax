@@ -28,6 +28,7 @@ import pytest
 import torch
 
 from relax.backends.sglang.lora_client import SGLangLoRAClient
+from relax.engine.lora_versions.artifact import write_adapter_artifact
 from relax.engine.lora_versions.identity import AdapterSnapshot, snapshot_adapter
 from relax.engine.lora_versions.manager import PublicationError, SessionKey, VersionState
 from relax.engine.lora_versions.publisher import LoRAPublisher
@@ -381,8 +382,17 @@ async def score_suffix(client, name, fixture):
 
 
 @pytest.mark.asyncio
-async def test_numerical_baselines_kv_isolation_and_slot_reuse(lora_fixture, gpu_engines, record_property):
+@pytest.mark.parametrize("transport", ["shm", "file"])
+async def test_numerical_baselines_kv_isolation_and_slot_reuse(
+    lora_fixture, gpu_engines, record_property, transport, tmp_path
+):
     old, new = lora_fixture.old, lora_fixture.new
+    sources = (
+        [write_adapter_artifact(adapter, tmp_path / "artifacts") for adapter in (old, new)]
+        if transport == "file"
+        else [old, new]
+    )
+    record_property("transport", transport)
     record_property("atol", ATOL)
     record_property("rtol", RTOL)
     record_property("score_input_ids", json.dumps(lora_fixture.score_prefix + lora_fixture.score_suffix))
@@ -390,8 +400,8 @@ async def test_numerical_baselines_kv_isolation_and_slot_reuse(lora_fixture, gpu
     left, right = gpu_engines.values()
     left_id = (await left.inventory())["instance_id"]
     right_id = (await right.inventory())["instance_id"]
-    old_receipt = await left.load(old, left_id, 1)
-    await right.load(new, right_id, 1)
+    old_receipt = await left.load(sources[0], left_id, 1)
+    await right.load(sources[1], right_id, 1)
     baselines = []
     for label, client, adapter in [("a", left, old), ("b", right, new)]:
         # Compare equal cache histories: hybrid models may compute a cached
@@ -421,8 +431,8 @@ async def test_numerical_baselines_kv_isolation_and_slot_reuse(lora_fixture, gpu
     separation = float(np.median(np.abs(baseline_a - baseline_b)))
     record_property("baseline_separation", separation)
     assert separation >= 100 * ATOL, "A/B fixture is insufficiently distinguishable; do not loosen numerical tolerance"
-    await left.load(new, left_id, 2)
-    await right.load(old, right_id, 2)
+    await left.load(sources[1], left_id, 2)
+    await right.load(sources[0], right_id, 2)
     errors = []
     for client, adapter, baseline, warm in [(left, new, baseline_b, warm_b), (right, old, baseline_a, warm_a)]:
         actual, cached = await score_suffix(client, adapter.identity.lora_name, lora_fixture)
@@ -447,7 +457,8 @@ async def test_numerical_baselines_kv_isolation_and_slot_reuse(lora_fixture, gpu
     third = snapshot_adapter(
         3, new.copy_tensors(), new.config, base_fingerprint=json.loads(new.manifest_json)["base_fingerprint"]
     )
-    await left.load(third, left_id, 3)
+    third_source = write_adapter_artifact(third, tmp_path / "artifacts") if transport == "file" else third
+    await left.load(third_source, left_id, 3)
     actual, cached = await score_suffix(left, third.identity.lora_name, lora_fixture)
     record_property("reused_slot_logprobs", json.dumps(actual.tolist()))
     record_property("reused_slot_cached_tokens", cached)

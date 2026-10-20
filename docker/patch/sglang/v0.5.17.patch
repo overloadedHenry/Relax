@@ -4187,3 +4187,125 @@ index 2cda3ba..a8a0bdc 100644
          return result
  
      def update_lora_from_distributed(
+diff --git a/python/sglang/srt/lora/relax_control.py b/python/sglang/srt/lora/relax_control.py
+index acd1c7c..dc16df9 100644
+--- a/python/sglang/srt/lora/relax_control.py
++++ b/python/sglang/srt/lora/relax_control.py
+@@ -6,4 +6,5 @@ import hashlib
+ import json
+ from dataclasses import dataclass
++from pathlib import Path
+ from uuid import uuid4
+
+@@ -68,4 +69,35 @@ def verify_snapshot(req, tensors):
+
+
++def read_artifact_tensors(req):
++    """Read engine-format tensors locally on each worker, without HF repacking.
++
++    The caller verifies these exact tensors before passing them to the model;
++    paths alone are not evidence of successful transfer or complete content.
++    """
++    from safetensors.torch import load_file
++
++    path = Path(req.relax_artifact_path)
++    if not path.is_absolute():
++        raise ValueError("managed artifact path must be absolute")
++    metadata = json.loads((path / "manifest.json").read_text())
++    identity = metadata["identity"]
++    if (
++        identity["digest"] != req.relax_digest
++        or req.lora_name
++        != f"relax_lora@{identity['version_id']}.{req.relax_digest[:12]}"
++        or metadata["snapshot"] != json.loads(req.relax_manifest)
++        or json.loads((path / "adapter_config.json").read_text()) != req.config_dict
++    ):
++        raise ValueError("artifact identity or manifest mismatch")
++    # Own the bytes before verification; later filesystem changes must not
++    # mutate a mapped tensor between hashing and model installation.
++    return {
++        name: tensor.clone()
++        for name, tensor in load_file(
++            str(path / "adapter_model.safetensors"), device="cpu"
++        ).items()
++    }
++
++
+ @dataclass
+ class ManagedAdapter:
+@@ -147,4 +179,15 @@ class RelaxLoRAControl:
+                 "managed load requires immutable identity, manifest and pinned=True"
+             )
++        artifact_path = getattr(req, "relax_artifact_path", None)
++        if (artifact_path is not None) == bool(req.serialized_named_tensors):
++            raise ValueError("managed load requires exactly one tensor source")
++        if artifact_path is not None and (
++            not Path(artifact_path).is_absolute()
++            or req.load_format is not None
++            or req.added_tokens_config is not None
++        ):
++            raise ValueError(
++                "managed artifacts require an absolute path and unmodified tensor layout"
++            )
+         async with self.lock:
+             key = (req.lora_name, req.relax_attempt_id)
+@@ -180,7 +223,8 @@ class RelaxLoRAControl:
+         self.manager.auto_create_handle_loop()
+         try:
+-            req.serialized_named_tensors = normalize_serialized_named_tensor_payloads(
+-                req.serialized_named_tensors
+-            )
++            if getattr(req, "relax_artifact_path", None) is None:
++                req.serialized_named_tensors = normalize_serialized_named_tensor_payloads(
++                    req.serialized_named_tensors
++                )
+             async with self.manager.lora_update_lock:
+                 # Even a failed RPC can have changed a worker: retain the ID until unload ACK.
+diff --git a/python/sglang/srt/managers/io_struct.py b/python/sglang/srt/managers/io_struct.py
+index 9e14502..1515965 100644
+--- a/python/sglang/srt/managers/io_struct.py
++++ b/python/sglang/srt/managers/io_struct.py
+@@ -2171,4 +2171,5 @@ class LoadLoRAAdapterFromTensorsReqInput(BaseReq, kw_only=True):
+     relax_digest: Optional[str] = None
+     relax_manifest: Optional[str] = None
++    relax_artifact_path: Optional[str] = None
+
+     def to_ref(self) -> LoRARef:
+diff --git a/python/sglang/srt/managers/tp_worker.py b/python/sglang/srt/managers/tp_worker.py
+index a8a0bdc..5a83ed8 100644
+--- a/python/sglang/srt/managers/tp_worker.py
++++ b/python/sglang/srt/managers/tp_worker.py
+@@ -247,13 +247,25 @@ class BaseTpWorker(ABC):
+         # The LoRA code handles TP sharding internally using slice_lora_a_weights
+         # and slice_lora_b_weights methods (see lora/layers.py and mem_pool.py).
+-        data = self._deserialize_own_rank(recv_req.serialized_named_tensors)
+-        if recv_req.load_format == "flattened_bucket":
+-            bucket = FlattenedTensorBucket(
+-                flattened_tensor=data["flattened_tensor"],
+-                metadata=data["metadata"],
+-            )
+-            tensors = dict(bucket.reconstruct_tensors())
++        if recv_req.relax_artifact_path is not None:
++            from sglang.srt.lora.relax_control import read_artifact_tensors
++
++            if (
++                recv_req.relax_attempt_id is None
++                or recv_req.serialized_named_tensors
++                or recv_req.load_format is not None
++                or recv_req.added_tokens_config is not None
++            ):
++                raise ValueError("file tensors require an exclusive managed load")
++            tensors = read_artifact_tensors(recv_req)
+         else:
+-            tensors = data
++            data = self._deserialize_own_rank(recv_req.serialized_named_tensors)
++            if recv_req.load_format == "flattened_bucket":
++                bucket = FlattenedTensorBucket(
++                    flattened_tensor=data["flattened_tensor"],
++                    metadata=data["metadata"],
++                )
++                tensors = dict(bucket.reconstruct_tensors())
++            else:
++                tensors = data
+         if recv_req.expected_checksums is not None:
+             import hashlib

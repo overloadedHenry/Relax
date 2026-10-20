@@ -1,12 +1,13 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Immutable LoRA control client; shared-memory transport requires the same
-host."""
+"""Immutable LoRA control client for shared files or same-host shared
+memory."""
 
 from typing import Any
 
 import httpx
 
+from relax.engine.lora_versions.artifact import AdapterArtifact
 from relax.engine.lora_versions.identity import AdapterSnapshot
 
 
@@ -25,29 +26,35 @@ class SGLangLoRAClient:
         response.raise_for_status()
         return response.json()
 
-    async def load(self, snapshot: AdapterSnapshot, instance_id: str, attempt_id: int) -> dict[str, Any]:
-        from sglang.srt.utils import MultiprocessingSerializer
-        from torch.multiprocessing import get_sharing_strategy, set_sharing_strategy
-
+    async def load(
+        self, snapshot: AdapterSnapshot | AdapterArtifact, instance_id: str, attempt_id: int
+    ) -> dict[str, Any]:
         inventory = await self.inventory()
         if inventory["instance_id"] != instance_id:
             raise ValueError("ENGINE_INSTANCE_MISMATCH")
-        key = (instance_id, snapshot.identity.lora_name, attempt_id)
-        if key not in self._payloads:
-            tensors = snapshot.copy_tensors()
-            previous = get_sharing_strategy()
-            try:
-                set_sharing_strategy("file_system")
-                serialized = MultiprocessingSerializer.serialize(tensors, output_str=True)
-            finally:
-                set_sharing_strategy(previous)
-            self._payloads[key] = tensors, serialized
+        if isinstance(snapshot, AdapterArtifact):
+            source = {"relax_artifact_path": str(snapshot.path), "serialized_named_tensors": []}
+        else:
+            from sglang.srt.utils import MultiprocessingSerializer
+            from torch.multiprocessing import get_sharing_strategy, set_sharing_strategy
+
+            key = (instance_id, snapshot.identity.lora_name, attempt_id)
+            if key not in self._payloads:
+                tensors = snapshot.copy_tensors()
+                previous = get_sharing_strategy()
+                try:
+                    set_sharing_strategy("file_system")
+                    serialized = MultiprocessingSerializer.serialize(tensors, output_str=True)
+                finally:
+                    set_sharing_strategy(previous)
+                self._payloads[key] = tensors, serialized
+            source = {"serialized_named_tensors": [self._payloads[key][1]] * inventory["tp_size"]}
         response = await self.http.post(
             "/relax/lora/load",
             json={
                 "lora_name": snapshot.identity.lora_name,
                 "config_dict": snapshot.config,
-                "serialized_named_tensors": [self._payloads[key][1]] * inventory["tp_size"],
+                **source,
                 "pinned": True,
                 "relax_instance_id": instance_id,
                 "relax_attempt_id": attempt_id,

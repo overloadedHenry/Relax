@@ -6,6 +6,7 @@ routing."""
 import asyncio
 from typing import TYPE_CHECKING
 
+from .artifact import AdapterArtifact
 from .identity import AdapterSnapshot
 from .manager import CleanupObservation, LoRAVersionManager, Publication, PublicationError, Replica, VersionState
 
@@ -23,7 +24,7 @@ class LoRAPublisher:
         self.manager = manager
         self.engines = dict(engines)
         self.probe_input_ids = list(probe_input_ids)
-        self.snapshots: dict[int, AdapterSnapshot] = {}
+        self.snapshots: dict[int, AdapterSnapshot | AdapterArtifact] = {}
         self._publish_lock = asyncio.Lock()
         self._reconcile_lock = asyncio.Lock()
 
@@ -78,12 +79,15 @@ class LoRAPublisher:
         ):
             raise PublicationError("STALE_ATTEMPT", "publication changed while verifying")
 
-    async def publish(self, snapshot: AdapterSnapshot) -> Publication:
+    async def publish(self, snapshot: AdapterSnapshot | AdapterArtifact) -> Publication:
         """Reserve -> load every engine -> checksum/probe -> single commit.
 
         Cancellation fences via subsequent reconciliation. The manager retains
         occupied capacity and this object retains snapshot storage meanwhile.
         The runtime should call reconcile periodically, including after errors.
+        File artifacts must remain available through recovery and cleanup; this
+        publisher drops metadata after reclamation but never deletes shared
+        files.
         """
         async with self._publish_lock:
             reservation = self.manager.reserve(snapshot.identity, snapshot.fingerprints)
