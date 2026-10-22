@@ -7,6 +7,7 @@ import ast
 import asyncio
 import base64
 import binascii
+import copy
 import dataclasses
 import io
 import json
@@ -14,10 +15,12 @@ import pickle
 import sys
 import typing
 import uuid
-from collections import OrderedDict
+from collections import Counter, OrderedDict
+from enum import IntEnum
+from functools import total_ordering
 from multiprocessing.reduction import ForkingPickler
 from types import ModuleType, SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 
 import httpx
 import msgspec
@@ -736,6 +739,7 @@ def tokenizer_methods(runtime):
     path = sglang_source_path("srt/managers/tokenizer_manager.py")
     tree = ast.parse(path.read_text())
     cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "TokenizerManager")
+    async_send = any(isinstance(n, ast.AsyncFunctionDef) and n.name == "_send_one_request" for n in cls.body)
     names = {
         "_remove_req_state",
         "_release_lora_lease",
@@ -747,11 +751,21 @@ def tokenizer_methods(runtime):
         "generate_request",
         "_validate_and_resolve_lora",
         "_discard_pending_req_states",
+        "_release_req_states_on_failure",
+        "_wait_for_request_unpaused",
+        "_raise_if_request_aborted",
+        "_handle_batch_request",
+        "_collect_batch_responses",
+        "_init_req_state",
+        "_register_child_rid",
+        "_raise_if_logical_rid_aborted",
+        "_raise_if_logical_request_aborted",
     }
     cls.body = [n for n in cls.body if getattr(n, "name", None) in names]
     cls.bases = []
     ns = {
         **vars(runtime),
+        "copy": copy,
         "ReqState": object,
         "Optional": typing.Optional,
         "Union": typing.Union,
@@ -776,12 +790,19 @@ def tokenizer_methods(runtime):
     )
     exec(compile(ast.fix_missing_locations(module), str(path), "exec"), ns)
     manager = ns["TokenizerManager"]()
+    manager._test_async_send = async_send
     manager.rid_to_state = {}
     manager._lora_draining_requests = {}
     manager._lora_release_tasks = set()
     manager.child_rid_to_logical_rid = {}
     manager.logical_rid_to_child_rids = {}
     manager.server_args = SimpleNamespace(batch_notify_size=8)
+    # SGLang 0.5.20 reads request configuration through runtime-context accessors.
+    ns.update(
+        get_lora=lambda: manager.server_args,
+        get_serving=lambda: manager.server_args,
+        get_disagg=lambda: manager.server_args,
+    )
     manager.lora_registry = runtime.LoRARegistry()
     return manager
 
@@ -826,7 +847,8 @@ async def test_parallel_children_share_one_reference_until_last_completion(runti
     )
     manager.rid_to_state["parent"] = parent
     manager._raise_if_logical_rid_aborted = lambda _: None
-    manager._init_req_state = lambda obj, request, lifecycle_id: manager.rid_to_state.update(
+    manager._raise_if_request_aborted = lambda _: None
+    manager._init_req_state = lambda obj, request=None, lifecycle_id=None: manager.rid_to_state.update(
         {obj.rid: SimpleNamespace(lora_lease=None, dispatched=True, finished=False, lifecycle_id=lifecycle_id)}
     )
     manager._register_child_rid = lambda *_: None
@@ -844,7 +866,8 @@ async def test_parallel_children_share_one_reference_until_last_completion(runti
 
 
 @pytest.mark.asyncio
-async def test_predispatch_tokenization_failure_releases_acquired_reference(runtime):
+@pytest.mark.parametrize("dispatched", [False, True])
+async def test_request_failure_releases_only_after_scheduler_terminal(runtime, dispatched):
     manager = tokenizer_methods(runtime)
     ref = runtime.LoRARef(lora_name="a", lora_path="__tensor__")
     await manager.lora_registry.register(ref)
@@ -854,9 +877,25 @@ async def test_predispatch_tokenization_failure_releases_acquired_reference(runt
         lora_path="a",
         max_thinking_tokens=None,
         routed_dp_rank=None,
+        return_prompt_token_ids=False,
+        return_logprob=False,
+        stream=False,
         normalize_batch_and_arguments=lambda: None,
     )
-    state = SimpleNamespace(obj=obj, lora_lease=None, dispatched=False, finished=False, lifecycle_id=object())
+    state = SimpleNamespace(
+        obj=obj,
+        lora_lease=None,
+        dispatched=False,
+        finished=False,
+        abort_requested=False,
+        lifecycle_id=object(),
+        time_stats=Mock(),
+        output_ids=[],
+        get_text=lambda: "",
+        prompt_token_ids=None,
+        out_list=[],
+        event=asyncio.Event(),
+    )
     manager.auto_create_handle_loop = lambda: None
     manager._set_default_priority = lambda _: None
     manager._init_req_state = lambda *_: manager.rid_to_state.update({obj.rid: state}) or {obj.rid: state.lifecycle_id}
@@ -869,17 +908,134 @@ async def test_predispatch_tokenization_failure_releases_acquired_reference(runt
     manager.is_pause = False
     manager.model_update_lock = runtime.RWLock()
     manager._raise_if_logical_request_aborted = lambda _: None
+    manager._raise_if_logical_rid_aborted = lambda _: None
+    manager.encoder_dispatch_ready = {}
+    manager.abort_request = Mock()
+    manager.config_value = lambda _: "0"
 
     async def tokenize(_):
         assert manager.lora_registry.request_count(ref.lora_id) == 1
-        raise ValueError("input length exceeds context length")
+        if not dispatched:
+            raise ValueError("input length exceeds context length")
+        return SimpleNamespace(rid=obj.rid)
+
+    def dispatch(_):
+        state.dispatched = True
+        raise asyncio.CancelledError()
 
     manager._tokenize_one_request = tokenize
-    with pytest.raises(ValueError, match="context length"):
+    manager._send_one_request = AsyncMock(side_effect=dispatch) if manager._test_async_send else dispatch
+    with pytest.raises(asyncio.CancelledError if dispatched else ValueError):
         await manager.generate_request(obj).__anext__()
+    if dispatched:
+        assert manager.lora_registry.request_count(ref.lora_id) == 1
+        terminal = SimpleNamespace(rid=obj.rid, abort_message=None, finished_reason=None, weight_versions=None)
+        manager._handle_abort_req(terminal)
+        manager._handle_abort_req(terminal)
     await asyncio.gather(*manager._lora_release_tasks)
     assert manager.lora_registry.request_count(ref.lora_id) == 0
     assert manager.rid_to_state == {}
+    assert not manager._lora_draining_requests
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "rid,lora_paths", [(None, ["a", "b"]), ("batch", ["a", "b"]), (["p0", "p1"], ["a", "b"]), (None, ["a", None])]
+)
+async def test_parallel_batch_keeps_lease_through_prefix_and_all_children(runtime, monkeypatch, rid, lora_paths):
+    manager = tokenizer_methods(runtime)
+    refs = {name: runtime.LoRARef(lora_name=name, lora_path="__tensor__") for name in ("a", "b")}
+    for ref in refs.values():
+        await manager.lora_registry.register(ref)
+    # Execute the real request normalizer and __getitem__; autogenerated RIDs
+    # differ between SGLang versions and must not create unused parent leases.
+    path = sglang_source_path("srt/managers/io_struct.py")
+    cls = next(node for node in ast.parse(path.read_text()).body if getattr(node, "name", None) == "GenerateReqInput")
+    module = ModuleType("managed_request_fixture")
+    module.__dict__.update(
+        dataclass=dataclasses.dataclass,
+        field=dataclasses.field,
+        uuid=uuid,
+        Counter=Counter,
+        IntEnum=IntEnum,
+        total_ordering=total_ordering,
+    )
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    helpers = []
+    for source, name in (
+        ("srt/model_executor/forward_batch_info.py", "CaptureHiddenMode"),
+        ("srt/managers/schedule_batch.py", "get_return_hidden_states_mode"),
+    ):
+        helpers.extend(
+            node
+            for node in ast.parse(sglang_source_path(source).read_text()).body
+            if getattr(node, "name", None) == name
+        )
+    code = ast.Module(
+        body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), *helpers, cls],
+        type_ignores=[],
+    )
+    exec(compile(ast.fix_missing_locations(code), str(path), "exec"), module.__dict__)
+    obj = module.GenerateReqInput(input_ids=[[1, 2], [3, 4]], sampling_params={"n": 3}, lora_path=lora_paths, rid=rid)
+    namespace = manager._init_req_state.__func__.__globals__
+    namespace["APIServerReqTimeStats"] = lambda **_: Mock()
+    namespace["ReqState"] = lambda out, finished, event, request, stats, **kwargs: SimpleNamespace(
+        out_list=out,
+        finished=finished,
+        event=event,
+        obj=request,
+        time_stats=stats,
+        lora_lease=None,
+        dispatched=False,
+        abort_requested=False,
+        lifecycle_id=kwargs.get("lifecycle_id"),
+    )
+    manager.enable_trace = False
+    manager.disaggregation_mode = "null"
+    manager.enable_lora = True
+    manager.server_args.language_only = False
+    manager.server_args.max_loaded_loras = None
+    manager.server_args.enable_strict_thinking = False
+    manager.auto_create_handle_loop = lambda: None
+    manager._set_default_priority = lambda _: None
+    manager.request_logger = Mock()
+    manager.tokenizer = None
+    manager.is_pause = False
+    manager.is_pause_cond = asyncio.Condition()
+    manager.model_update_lock = runtime.RWLock()
+    manager.encoder_dispatch_ready = {}
+    manager.abort_request = Mock()
+    expected = {name: int(name in lora_paths) for name in refs}
+
+    async def tokenize(prompt):
+        assert len(manager.rid_to_state) == 2
+        assert {name: manager.lora_registry.request_count(ref.lora_id) for name, ref in refs.items()} == expected
+        assert prompt.lora_id == (refs[prompt.lora_path].lora_id if prompt.lora_path else None)
+        return SimpleNamespace(rid=prompt.rid, sampling_params=SimpleNamespace(), stream=False)
+
+    manager._tokenize_one_request = tokenize
+    dispatched = []
+
+    def dispatch(request):
+        assert {name: manager.lora_registry.request_count(ref.lora_id) for name, ref in refs.items()} == expected
+        manager.rid_to_state[request.rid].dispatched = True
+        dispatched.append(request.rid)
+
+    manager._send_one_request = AsyncMock(side_effect=dispatch) if manager._test_async_send else dispatch
+
+    async def response(request, http_request):
+        manager.rid_to_state[request.rid].finished = True
+        manager._remove_req_state(request.rid)
+        await asyncio.sleep(0)
+        yield {"meta_info": {"id": request.rid}}
+
+    manager._wait_one_response = response
+    outputs = [value async for value in manager.generate_request(obj)]
+    await asyncio.gather(*manager._lora_release_tasks)
+    assert len(dispatched) == 8 and len(set(dispatched)) == 8
+    assert len(outputs) == 1 and len(outputs[0]) == 6
+    assert all(manager.lora_registry.request_count(ref.lora_id) == 0 for ref in refs.values())
+    assert not manager.rid_to_state and not manager._lora_draining_requests
 
 
 @pytest.mark.asyncio
@@ -996,7 +1152,9 @@ async def test_parallel_sampling_acquires_once_per_logical_prompt(runtime):
     normalizer = next(node for node in cls.body if getattr(node, "name", None) == "_normalize_lora_paths")
     ns = {}
     exec(compile(ast.Module(body=[normalizer], type_ignores=[]), str(path), "exec"), ns)
-    obj = SimpleNamespace(is_single=False, rid=["prompt1", "prompt2"], lora_path=["a", "b"], parallel_sample_num=3)
+    obj = SimpleNamespace(
+        is_single=False, batch_size=2, rid=["prompt1", "prompt2"], lora_path=["a", "b"], parallel_sample_num=3
+    )
     ns["_normalize_lora_paths"](obj, 6)
     assert len(obj.lora_path) == 6
     for rid in obj.rid:

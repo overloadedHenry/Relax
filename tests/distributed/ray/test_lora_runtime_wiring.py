@@ -103,6 +103,15 @@ def test_lora_configuration_rejects_generation_that_already_started(wiring):
     assert not events
 
 
+def test_lora_configuration_rejects_global_health_recovery(wiring):
+    manager, _host, events, _agentic, factory = wiring
+    manager.args.use_health_check = True
+    with pytest.raises(ValueError, match="disabled automatic recovery"):
+        manager.configure_lora_versions("artifact", [1])
+    assert not events and manager._lora_runtime is None
+    factory.options.assert_not_called()
+
+
 def prepare_training(manager, tmp_path):
     manager.args.fully_async = True
     manager.args.hybrid = manager.args.colocate = manager.args.offload_rollout = False
@@ -157,6 +166,7 @@ def test_failed_training_bootstrap_cannot_resume_unmanaged_generation(wiring, tm
         ("colocate", True),
         ("offload_rollout", True),
         ("train_backend", "fsdp"),
+        ("use_health_check", True),
     ],
 )
 def test_training_configuration_rejects_unsupported_modes(wiring, tmp_path, argument, value):

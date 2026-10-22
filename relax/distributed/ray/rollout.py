@@ -16,7 +16,6 @@ from typing import Any, Optional
 
 import ray
 import sglang_router
-import transfer_queue as tq
 import yaml
 from packaging.version import parse
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
@@ -61,6 +60,7 @@ from relax.utils.s3_model_loader import (
     prepare_model_maybe_update_args,
 )
 from relax.utils.scale_utils import PrecheckProbeCategory, ScaleOutFailure, ScaleOutFailureCategory
+from relax.utils.tq.lifecycle import attach_tq_client, detach_tq_client
 from relax.utils.tracking_utils import init_tracking
 from relax.utils.training.train_dump_utils import (
     save_debug_rollout_data,
@@ -921,8 +921,10 @@ class RolloutManager(ReloadableMixin):
 
         self.data_source = data_source
 
-        tq.init(self.args.tq_config)
-        self.data_system_client = tq.get_client()
+        self.data_system_client = attach_tq_client(
+            self.args.tq_config,
+            role="rollout_worker",
+        )
 
         logger.info(f"import {self.args.rollout_function_path} as generate_rollout function.")
         logger.info(f"import {self.args.eval_function_path} as eval_generate_rollout function.")
@@ -1089,6 +1091,7 @@ class RolloutManager(ReloadableMixin):
                 or not self.args.use_agentic_rollout
                 or not is_lora_adapter_mode(self.args)
                 or self.args.use_fault_tolerance
+                or getattr(self.args, "use_health_check", False)
                 or len(self.servers) != 1
             ):
                 raise ValueError(
@@ -1168,7 +1171,12 @@ class RolloutManager(ReloadableMixin):
                 or getattr(self, "_lora_configuration_failed", False)
             ):
                 raise RuntimeError("LoRA versions are already configured or being configured")
-            if not self.args.use_agentic_rollout or self.args.use_fault_tolerance or len(self.servers) != 1:
+            if (
+                not self.args.use_agentic_rollout
+                or self.args.use_fault_tolerance
+                or getattr(self.args, "use_health_check", False)
+                or len(self.servers) != 1
+            ):
                 raise ValueError("managed LoRA requires Agentic rollout, one model, and disabled automatic recovery")
             if getattr(self, "_generation_started", False):
                 raise RuntimeError("LoRA versions must be configured before generation starts")
@@ -1243,9 +1251,15 @@ class RolloutManager(ReloadableMixin):
                 self._lora_runtime = None
             self._shutdown_all_engines()
         finally:
-            # Routers are child processes of this Ray actor, so its process
-            # owns the registry; the Controller driver's registry is separate.
-            stop_launched_routers()
+            try:
+                # Deregister the worker's Mooncake segment before a fast restart.
+                if getattr(self, "data_system_client", None) is not None:
+                    detach_tq_client()
+            finally:
+                self.data_system_client = None
+                # Routers are child processes of this Ray actor, so its process
+                # owns the registry; the Controller driver's registry is separate.
+                stop_launched_routers()
 
     def _shutdown_all_engines(self, timeout: float = 15.0):
         """Shut down all SGLang engine actors and their child processes.
@@ -2313,10 +2327,11 @@ class RolloutManager(ReloadableMixin):
                     srv.engine_groups[0],
                 ),
             )
+            actors_per_replica = max(1, gpus_per_engine // self.args.num_gpus_per_node)
             new_group = EngineGroup(
                 args=self.args,
                 pg=pg_tuple,
-                all_engines=[None],  # Single engine per replica
+                all_engines=[None] * actors_per_replica,
                 num_gpus_per_engine=gpus_per_engine,
                 num_new_engines=0,
                 worker_type="regular",
