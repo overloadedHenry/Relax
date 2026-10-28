@@ -337,6 +337,50 @@ def compute_cispo_loss(
     return pg_loss, clipfrac
 
 
+def compute_dis_loss(
+    log_probs: torch.Tensor,
+    ppo_kl: torch.Tensor,
+    advantages: torch.Tensor,
+    loss_mask: torch.Tensor,
+    epsilon_low: float,
+    epsilon_high: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Decoupled importance sampling, returning unreduced loss and kept
+    actions.
+
+    ``ppo_kl`` is rollout log-probability minus current log-probability. The
+    closed ratio interval is ``[1-epsilon_low, 1+epsilon_high]``. Only current
+    log-probabilities receive gradients; importance weights and advantages are
+    detached. Test bounds before exponentiation to avoid overflow on dropped
+    tokens. Inactive observation placeholders never enter the arithmetic.
+
+    Reduce with the ORIGINAL action mask/count, not the returned keep mask.
+    A zero loss/gradient does not by itself prevent an AdamW optimizer update.
+    Input assertions stay on-device (asynchronous assertions on CUDA).
+    """
+    if not math.isfinite(epsilon_low) or not 0 <= epsilon_low < 1:
+        raise ValueError("DIS epsilon_low must be finite and in [0, 1)")
+    if not math.isfinite(epsilon_high) or epsilon_high < 0:
+        raise ValueError("DIS epsilon_high must be finite and nonnegative")
+    tensors = (log_probs, ppo_kl, advantages, loss_mask)
+    if any(t.shape != log_probs.shape or t.device != log_probs.device for t in tensors):
+        raise ValueError("DIS inputs must have identical shapes and devices")
+    torch._assert_async(((loss_mask == 0) | (loss_mask == 1)).all(), "DIS requires a binary generation mask")
+    active = loss_mask.bool()
+    dtype = torch.float64 if any(t.dtype == torch.float64 for t in tensors[:3]) else torch.float32
+    current = torch.where(active, log_probs.to(dtype), 0)
+    log_ratio = torch.where(active, -ppo_kl.detach().to(dtype), 0)
+    advantage = torch.where(active, advantages.detach().to(dtype), 0)
+    torch._assert_async(
+        (torch.isfinite(current) & torch.isfinite(log_ratio) & torch.isfinite(advantage)).all(),
+        "DIS requires finite log-probabilities and advantages on action tokens",
+    )
+    keep = active & (log_ratio >= math.log(1 - epsilon_low)) & (log_ratio <= math.log(1 + epsilon_high))
+    safe_log_ratio = torch.where(keep, log_ratio, 0)
+    weight = torch.where(keep, safe_log_ratio.exp(), 0)
+    return -weight * advantage * current, keep
+
+
 @torch.compile(dynamic=True)
 def compute_rloo_loss(
     log_probs: torch.Tensor,
@@ -1239,6 +1283,137 @@ def chunked_gae(
     returns = advantages + values
 
     return advantages, returns
+
+
+def _discounted_reverse_scan(deltas: torch.Tensor, coefficients: torch.Tensor) -> torch.Tensor:
+    """Solve A[t] = delta[t] + coefficient[t] * A[t+1] in log(T) tensor stages.
+
+    Affine-pair composition handles zero coefficients without dividing by a
+    cumulative product. Shapes remain static: no nonzero/gather-length sync
+    or Python loop over individual tokens is needed.
+    """
+    advantages = deltas
+    weights = coefficients
+    stride = 1
+    while stride < deltas.shape[-1]:
+        following = F.pad(advantages[:, stride:], (0, stride))
+        following_weights = F.pad(weights[:, stride:], (0, stride))
+        advantages = advantages + weights * following
+        weights = weights * following_weights
+        stride *= 2
+    return advantages
+
+
+@torch.no_grad()
+def get_masked_advantages_and_returns_batch(
+    values_list: list[torch.Tensor],
+    episode_returns: list[float] | list[torch.Tensor] | torch.Tensor,
+    loss_masks: list[torch.Tensor],
+    *,
+    gamma: float,
+    policy_lambd: float | None,
+    critic_lambd: float,
+    observation_mode: str,
+    policy_lambda_mode: str = "fixed",
+    policy_alpha: float | None = None,
+) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+    """Terminal, scalar-reward GAE for complete, unsharded response sequences.
+
+    Both modes anchor reward and terminal bootstrap at the last ACTION token;
+    later observations/padding are excluded from the Bellman time axis. Full
+    mode includes intermediate observation states; skip mode connects adjacent
+    actions directly. Outputs on observations are zero, and inputs are not
+    mutated. Values are already aligned to the state before each response token.
+
+    Policy lambda is fixed or ``1 - 1/(alpha * action_count)``; critic returns
+    use their own fixed lambda and are unaffected by policy whitening. This
+    kernel does not perform whitening, KL reward shaping, or CP collectives.
+    """
+    if observation_mode not in {"full", "skip"}:
+        raise ValueError("observation_mode must be 'full' or 'skip'; use the existing kernel for legacy GAE")
+    if policy_lambda_mode not in {"fixed", "length-adaptive"}:
+        raise ValueError("policy_lambda_mode must be 'fixed' or 'length-adaptive'")
+    for name, value in (("gamma", gamma), ("critic_lambd", critic_lambd)):
+        if not math.isfinite(value) or not 0 <= value <= 1:
+            raise ValueError(f"{name} must be finite and in [0, 1]")
+    if policy_lambda_mode == "fixed":
+        if policy_lambd is None or not math.isfinite(policy_lambd) or not 0 <= policy_lambd <= 1:
+            raise ValueError("Fixed policy_lambd must be finite and in [0, 1]")
+    elif policy_alpha is None or not math.isfinite(policy_alpha) or policy_alpha <= 0:
+        raise ValueError("Adaptive policy_alpha must be finite and positive")
+    if not values_list or len(values_list) != len(loss_masks):
+        raise ValueError("Expected nonempty, equally sized values and mask lists")
+    device = values_list[0].device
+    dtype = torch.float64 if any(v.dtype == torch.float64 for v in values_list) else torch.float32
+    lengths = []
+    masks = []
+    for value, mask in zip(values_list, loss_masks, strict=True):
+        if value.ndim != 1 or value.numel() == 0 or mask.shape != value.shape:
+            raise ValueError("Each response must have nonempty one-dimensional values and an equally shaped mask")
+        if value.device != device or mask.device != device:
+            raise ValueError("All values and generation masks must be on the same device")
+        torch._assert_async(((mask == 0) | (mask == 1)).all(), "GAE requires binary generation masks")
+        lengths.append(value.numel())
+        masks.append(mask.bool())
+    values = torch.nn.utils.rnn.pad_sequence([v.detach().to(dtype) for v in values_list], batch_first=True)
+    actions = torch.nn.utils.rnn.pad_sequence(masks, batch_first=True)
+    action_counts = actions.sum(dim=1)
+    torch._assert_async((action_counts > 0).all(), "GAE requires at least one action in every episode")
+    if isinstance(episode_returns, list) and any(isinstance(reward, torch.Tensor) for reward in episode_returns):
+        if not all(
+            isinstance(reward, torch.Tensor) and reward.ndim == 0 and reward.device == device
+            for reward in episode_returns
+        ):
+            raise ValueError("Tensor reward lists must contain scalar tensors on the values device")
+        # as_tensor(list_of_cuda_scalars) would extract each value on the host.
+        scores = torch.stack(episode_returns).detach().to(dtype)
+    else:
+        if isinstance(episode_returns, torch.Tensor) and episode_returns.device != device:
+            raise ValueError("Tensor episode returns must be on the values device")
+        scores = torch.as_tensor(episode_returns, dtype=dtype, device=device).detach()
+    if scores.shape != (len(values_list),):
+        raise ValueError("Expected one scalar episode return per response")
+    torch._assert_async(torch.isfinite(scores).all(), "GAE requires finite episode returns")
+    positions = torch.arange(values.shape[1], device=device).expand_as(actions)
+    last_action = torch.where(actions, positions, -1).amax(dim=1, keepdim=True)
+    prefix = positions <= last_action
+    relevant_values = actions if observation_mode == "skip" else prefix
+    values = torch.where(relevant_values, values, 0)
+    torch._assert_async(torch.isfinite(values).all(), "GAE requires finite values on its Bellman time axis")
+    rewards = torch.zeros_like(values).scatter(1, last_action, scores[:, None])
+    if policy_lambda_mode == "length-adaptive":
+        scaled_lengths = policy_alpha * action_counts.to(dtype)
+        torch._assert_async((scaled_lengths >= 1).all(), "Adaptive policy lambda requires alpha * action_count >= 1")
+        policy_lambda = (1 - scaled_lengths.reciprocal())[:, None]
+    else:
+        policy_lambda = values.new_full((len(values_list), 1), policy_lambd)
+
+    if observation_mode == "skip":
+        terminal = values.shape[1]
+        next_action = torch.where(actions, positions, terminal).flip([1]).cummin(dim=1).values.flip([1])
+        next_action = F.pad(next_action[:, 1:], (0, 1), value=terminal)
+        next_values = F.pad(values, (0, 1)).gather(1, next_action)
+        deltas = torch.where(actions, rewards + gamma * next_values - values, 0)
+        policy_coefficients = torch.where(actions, gamma * policy_lambda, 1)
+        critic_coefficients = torch.where(actions, torch.full_like(values, gamma * critic_lambd), 1)
+    else:
+        next_values = F.pad(values[:, 1:], (0, 1))
+        deltas = torch.where(prefix, rewards + gamma * next_values - values, 0)
+        policy_coefficients = (gamma * policy_lambda).expand_as(values)
+        critic_coefficients = torch.full_like(values, gamma * critic_lambd)
+    policy_coefficients = torch.where(positions < last_action, policy_coefficients, 0)
+    critic_coefficients = torch.where(positions < last_action, critic_coefficients, 0)
+    policy_advantages = _discounted_reverse_scan(deltas, policy_coefficients)
+    if policy_lambda_mode == "fixed" and policy_lambd == critic_lambd:
+        critic_advantages = policy_advantages
+    else:
+        critic_advantages = _discounted_reverse_scan(deltas, critic_coefficients)
+    advantages = torch.where(actions, policy_advantages, 0)
+    returns = torch.where(actions, critic_advantages + values, 0)
+    return (
+        [row[:length] for row, length in zip(advantages, lengths, strict=True)],
+        [row[:length] for row, length in zip(returns, lengths, strict=True)],
+    )
 
 
 def calculate_log_probs_and_entropy(

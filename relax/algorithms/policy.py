@@ -6,7 +6,8 @@ The kernels in :mod:`relax.utils.training.ppo_utils` take different argument
 lists. These adapters normalise them to ``fn(args, *, log_probs, ppo_kl,
 advantages)`` so the caller can look one up by name instead of branching on the
 algorithm. Score centering additionally consumes generation-time candidates
-through its explicit optional context.
+through its explicit optional context; DIS requires the original generation
+mask through ``loss_mask``.
 """
 
 from typing import Any, Callable
@@ -17,6 +18,7 @@ from relax.algorithms.score_centering import compute_score_centering_loss
 from relax.algorithms.spec import get_algorithm
 from relax.utils.training.ppo_utils import (
     compute_cispo_loss,
+    compute_dis_loss,
     compute_m2po_loss,
     compute_policy_loss,
     compute_rloo_loss,
@@ -127,6 +129,26 @@ def policy_loss_score_centering(
     return loss, torch.zeros_like(loss), *((value * mask).sum() / denominator for value in metrics.values())
 
 
+def policy_loss_dis(
+    args: Any,
+    *,
+    log_probs: torch.Tensor,
+    ppo_kl: torch.Tensor,
+    advantages: torch.Tensor,
+    loss_mask: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """DIS math adapter; original generation masks remain the loss denominator.
+
+    The second result is a token-aligned drop indicator, not a normalized
+    microbatch statistic. Training integration must separately aggregate kept
+    policy-signal counts and prevent optimizer steps when that count is zero.
+    """
+    loss, keep = compute_dis_loss(
+        log_probs, ppo_kl, advantages, loss_mask, args.dis_epsilon_low, args.dis_epsilon_high
+    )
+    return loss, (loss_mask.bool() & ~keep).float()
+
+
 POLICY_LOSS_FNS: dict[str, Callable[..., tuple[Any, ...]]] = {
     "ppo_clip": policy_loss_ppo_clip,
     "sapo": policy_loss_sapo,
@@ -134,6 +156,7 @@ POLICY_LOSS_FNS: dict[str, Callable[..., tuple[Any, ...]]] = {
     "m2po": policy_loss_m2po,
     "rloo": policy_loss_rloo,
     "score_centering": policy_loss_score_centering,
+    "dis": policy_loss_dis,
 }
 
 
@@ -144,6 +167,7 @@ def compute_policy_loss_for(
     ppo_kl: torch.Tensor,
     advantages: torch.Tensor,
     score_centering_context: dict[str, torch.Tensor] | None = None,
+    loss_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
     """Dispatch the registered policy loss and name its scalar diagnostics."""
     spec = get_algorithm(args.advantage_estimator)
@@ -152,6 +176,10 @@ def compute_policy_loss_for(
         if score_centering_context is None:
             raise ValueError("Score centering requires rollout and current candidate log-probabilities")
         extra["score_centering_context"] = score_centering_context
+    if spec.policy_loss_fn == "dis":
+        if loss_mask is None:
+            raise ValueError("DIS requires the original generation mask")
+        extra["loss_mask"] = loss_mask
     pg_loss, pg_clipfrac, *scalar_metric_values = POLICY_LOSS_FNS[spec.policy_loss_fn](
         args,
         log_probs=log_probs,

@@ -22,6 +22,7 @@ from relax.algorithms.spec import get_algorithm
 from relax.utils.training.ppo_utils import (
     get_advantages_and_returns_batch,
     get_grpo_returns,
+    get_masked_advantages_and_returns_batch,
     get_reinforce_plus_plus_baseline_advantages,
     get_reinforce_plus_plus_returns,
 )
@@ -124,11 +125,56 @@ def advantage_gae(
     )
 
 
+def advantage_masked_gae(
+    args: Any,
+    *,
+    rewards,
+    values,
+    loss_masks,
+    response_lengths,
+    **_unused,
+):
+    """Full/skip action-aware GAE adapter for complete CP=1 trajectories.
+
+    This mathematical route is intentionally not published as a trainable
+    AlgorithmSpec until optimizer-skip and critic-update contracts are wired.
+    Legacy PPO continues to use ``advantage_gae`` without changed defaults.
+    """
+    from megatron.core import mpu
+
+    if (
+        getattr(args, "context_parallel_size", 1) != 1
+        or getattr(args, "dynamic_context_parallel", False)
+        or mpu.get_context_parallel_world_size() != 1
+    ):
+        raise ValueError("Full/skip masked GAE currently requires static CP=1")
+    if args.kl_coef != 0:
+        raise ValueError("Full/skip masked GAE currently requires --kl-coef 0")
+    if values is None or loss_masks is None or response_lengths is None:
+        raise ValueError("Masked GAE requires values, generation masks and full response lengths")
+    if len(values) != len(response_lengths) or any(
+        value.numel() != length for value, length in zip(values, response_lengths, strict=True)
+    ):
+        raise ValueError("Masked GAE requires complete response values, not CP-local slices")
+    return get_masked_advantages_and_returns_batch(
+        values,
+        rewards,
+        loss_masks,
+        gamma=args.gamma,
+        policy_lambd=args.lambd,
+        critic_lambd=args.critic_gae_lambda,
+        observation_mode=args.gae_observation_mode,
+        policy_lambda_mode=args.policy_gae_lambda_mode,
+        policy_alpha=args.policy_gae_alpha,
+    )
+
+
 ADVANTAGE_FNS: dict[str, Callable[..., tuple[list[torch.Tensor], list[torch.Tensor]]]] = {
     "grpo_broadcast": advantage_grpo_broadcast,
     "reinforce_plus_plus": advantage_reinforce_plus_plus,
     "reinforce_plus_plus_baseline": advantage_reinforce_plus_plus_baseline,
     "gae": advantage_gae,
+    "masked_gae": advantage_masked_gae,
 }
 
 
